@@ -1,13 +1,116 @@
 :root {
   color-scheme: light dark;
   font-family: system-ui, sans-serif;
+  /* Matches the tuned #5177aa in identity.ts's COLOURS: focus rings and
+     controls are UI boundaries WCAG 1.4.11 holds to the same 3:1 bar
+     against either background as a drawn mark. */
+  --accent: #5177aa;
 }
 
 body {
   margin: 0 auto;
   max-width: 46rem;
-  padding: 1.5rem;
+  padding: 1rem 1.5rem 2rem;
   line-height: 1.5;
+}
+
+.top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+}
+
+.brand {
+  margin: 0;
+  font-size: 1.75rem;
+  font-weight: 700;
+}
+
+.brand a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.top nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+}
+
+.top nav a {
+  display: inline-block;
+  padding: 0.5rem 0;
+}
+
+.top nav a[aria-current="page"] {
+  font-weight: 700;
+  text-decoration-thickness: 2px;
+}
+
+.prompt {
+  font-size: 1.125rem;
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+  margin-bottom: 0.75rem;
+}
+
+#mode-note {
+  flex: 1 1 16rem;
+  font-size: 0.875em;
+}
+
+button {
+  min-height: 2.75rem;
+  padding: 0.5rem 1rem;
+  border: 2px solid var(--accent);
+  border-radius: 0.5rem;
+  background: Canvas;
+  color: CanvasText;
+  font: inherit;
+  cursor: pointer;
+}
+
+button[aria-pressed="true"],
+button[type="submit"] {
+  background: var(--accent);
+  color: #fff;
+}
+
+button:disabled {
+  border-style: dashed;
+  background: Canvas;
+  color: GrayText;
+  cursor: not-allowed;
+}
+
+button.danger {
+  border-color: #c8102e;
+}
+
+:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.filter,
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-height: 2.75rem;
+}
+
+.filter input,
+.check input {
+  inline-size: 1.25rem;
+  block-size: 1.25rem;
 }
 
 #wall {
@@ -20,14 +123,6 @@ body {
   cursor: crosshair;
 }
 
-#wall:focus-visible {
-  /* Matches the tuned #5177aa in identity.ts's COLOURS, not the old
-     #3d5a80 --- the focus ring is itself a UI boundary WCAG 1.4.11 holds
-     to the same 3:1-against-either-background bar as a drawn mark. */
-  outline: 3px solid #5177aa;
-  outline-offset: 2px;
-}
-
 #wall path {
   fill: none;
   stroke-width: 4;
@@ -36,7 +131,8 @@ body {
 }
 
 /* Someone else's stroke while it's still being drawn: lighter until it's
-   committed, then the same element simply loses this class. */
+   committed, then the same element simply loses this class. Dashed while
+   its hand decides whether to add it. */
 #wall path.preview {
   opacity: 0.55;
 }
@@ -49,13 +145,117 @@ body {
   stroke-width: 7;
 }
 
+/* This hand's own stroke before it's added: on its screen only. */
+#wall path.mine.draft {
+  stroke-dasharray: 14 6;
+}
+
 #wall path.halo {
   stroke: Canvas;
   stroke-width: 13;
 }
 
-#connection {
+#wall path.fresh {
+  stroke-width: 7;
+}
+
+#wall path.off-prompt {
+  opacity: 0.12;
+}
+
+#draft {
+  display: grid;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+  padding: 0.75rem 1rem;
+  border: 2px dashed var(--accent);
+  border-radius: 0.5rem;
+}
+
+#draft[hidden] {
+  display: none;
+}
+
+#draft p {
+  margin: 0;
+}
+
+textarea {
+  inline-size: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  padding: 0.5rem;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+}
+
+.quiet,
+#connection,
+#fresh {
   font-size: 0.875em;
+}
+
+.flash {
+  padding: 0.5rem 0.75rem;
+  border-left: 4px solid var(--accent);
+}
+
+.traces {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  gap: 1.5rem;
+}
+
+.traces article {
+  display: grid;
+  grid-template-columns: minmax(8rem, 14rem) 1fr;
+  gap: 1rem;
+  align-items: start;
+}
+
+.traces h2 {
+  margin: 0;
+  font-size: 1.125rem;
+}
+
+.traces p {
+  margin: 0.25rem 0 0.5rem;
+}
+
+.thumb {
+  width: 100%;
+  height: auto;
+  aspect-ratio: 5 / 3;
+  border: 1px solid currentColor;
+  border-radius: 0.375rem;
+}
+
+.thumb path {
+  fill: none;
+  stroke-width: 10;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+details {
+  margin-top: 0.5rem;
+}
+
+summary {
+  cursor: pointer;
+  padding: 0.5rem 0;
+}
+
+@media (max-width: 30rem) {
+  .traces article {
+    grid-template-columns: 1fr;
+  }
 }
 
 main img {

@@ -2,6 +2,8 @@ import { JSDOM } from "jsdom";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { expect, it } from "vitest";
+import type { Mark } from "../src/db.ts";
+import { wallPage } from "../src/pages.ts";
 
 // Every other test in spec/ drives the server over HTTP; none of them execute
 // public/wall.js itself, so a client-only bug (like the stuck pointerdown
@@ -13,6 +15,7 @@ import { expect, it } from "vitest";
 const wallSource = readFileSync("public/wall.js", "utf8");
 
 type Body = Record<string, unknown>;
+const TODAY = "a shadow you noticed";
 type Point = [number, number];
 
 function buildWall({
@@ -21,23 +24,40 @@ function buildWall({
   markStatus = 201,
   networkFail = false,
   previewLease = 5000,
+  previewStatus = 200,
+  previewDelay = 0,
   serverMarks = [],
+  liveMode = true,
+  autoPublish = true,
+  marks = [],
+  lastSeen,
 }: {
   canDraw: boolean;
   deferFetch?: boolean;
   markStatus?: number;
   networkFail?: boolean;
   previewLease?: number;
-  serverMarks?: { id: number; path: string; colour: string; mine: boolean }[];
+  previewStatus?: number;
+  previewDelay?: number;
+  serverMarks?: { id: number; path: string; colour: string; mine: boolean; prompt?: string | null }[];
+  // Most tests are about streaming, so they start with Draw live on and
+  // treat lifting the pointer as also pressing Add to the wall.
+  liveMode?: boolean;
+  autoPublish?: boolean;
+  marks?: Mark[];
+  lastSeen?: number;
 }) {
-  const dom = new JSDOM(
-    `<!doctype html><body>
-      <svg id="wall" viewBox="0 0 100 100"></svg>
-      <p id="status"></p>
-      <p id="connection"></p>
-    </body>`,
-    { runScripts: "dangerously", url: "http://localhost/" },
-  );
+  // The real page markup, so the controls wall.js looks for are exactly the
+  // ones the server renders.
+  const html = wallPage(
+    marks,
+    { id: "this-hand", colour: "#123456" },
+    canDraw ? 0 : 3_600_000 * 5,
+    previewLease,
+    TODAY,
+  ).replace(/<script[\s\S]*?<\/script>/, "");
+  const dom = new JSDOM(html, { runScripts: "dangerously", url: "http://localhost/" });
+  if (lastSeen !== undefined) dom.window.localStorage.setItem("trace:last-seen", String(lastSeen));
   const { window } = dom;
   const svg = window.document.getElementById("wall") as unknown as SVGSVGElement;
   const status = window.document.getElementById("status")!;
@@ -47,7 +67,7 @@ function buildWall({
   // pointer-capture implementation; stub both so wall.js's own coordinate
   // math and capture call don't blow up on a geometry jsdom never computes.
   (svg as unknown as { getBoundingClientRect: () => DOMRect }).getBoundingClientRect = () =>
-    ({ left: 0, top: 0, width: 100, height: 100 }) as DOMRect;
+    ({ left: 0, top: 0, width: 1000, height: 600 }) as DOMRect;
   (svg as unknown as { setPointerCapture: (id: number) => void }).setPointerCapture = () => {};
 
   // Every request wall.js makes, by route. deferFetch holds a mark's POST
@@ -62,6 +82,8 @@ function buildWall({
     const body = init?.body ? JSON.parse(init.body as string) : undefined;
     if (url === "/api/strokes/live") {
       previews.push(body);
+      if (previewDelay) await new Promise((resolve) => setTimeout(resolve, previewDelay));
+      if (previewStatus !== 200) return Response.json({ error: "refused" }, { status: previewStatus });
       return Response.json({ count: body.from + body.points.length });
     }
     if (url === "/api/strokes/live/cancel") {
@@ -79,9 +101,8 @@ function buildWall({
         resolveFetch = resolve;
       });
     }
-    return new Response(markStatus === 201 ? null : "Your mark is already on the wall.", {
-      status: markStatus,
-    });
+    if (markStatus === 201) return Response.json({ id: 900 + posted.length, nextAt: Date.now() + 86_400_000 }, { status: 201 });
+    return new Response("Your mark is already on the wall.", { status: markStatus });
   }) as typeof fetch;
 
   // wall.js opens one unconditionally on load; there's no server to answer
@@ -103,8 +124,12 @@ function buildWall({
   script.dataset.handColour = "#123456";
   script.dataset.canDraw = String(canDraw);
   script.dataset.previewLease = String(previewLease);
+  script.dataset.prompt = TODAY;
   script.textContent = wallSource;
   window.document.body.appendChild(script);
+  const $ = (id: string) => window.document.getElementById(id) as HTMLElement & HTMLInputElement;
+  if (liveMode && canDraw) $("mode").click();
+  const publish = () => $("draft").dispatchEvent(new window.Event("submit", { cancelable: true }));
 
   const gesture = (x: number, y: number, type: string, pointerType = "mouse") =>
     svg.dispatchEvent(
@@ -120,6 +145,7 @@ function buildWall({
     gesture(from, from, "pointerdown", pointerType);
     gesture(to, to, "pointermove", pointerType);
     gesture(to + 1, to + 1, "pointerup", pointerType);
+    if (autoPublish) publish();
   };
   const key = (k: string) => svg.dispatchEvent(new window.KeyboardEvent("keydown", { key: k }));
   // Enter, one arrow step, Enter: the keyboard-only path through the exact
@@ -128,6 +154,7 @@ function buildWall({
     key("Enter");
     key("ArrowRight");
     key("Enter");
+    if (autoPublish) publish();
   };
   // Flush the microtask queue fetch's promise chain runs on.
   const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -142,6 +169,8 @@ function buildWall({
   const previewPaths = () => [...svg.querySelectorAll("path.preview")];
 
   return {
+    $,
+    publish,
     window,
     svg,
     status,
@@ -183,13 +212,20 @@ it("tells a hand which stroke is theirs the moment its first mark lands", async 
   expect(status.textContent).toContain("the thicker stroke");
 });
 
-it("never attaches drawing listeners at all when canDraw starts false", async () => {
-  const { svg, posted, stroke, keyboardStroke, settle } = buildWall({ canDraw: false });
+it("during the cooldown, drawing is private practice: nothing is posted or streamed", async () => {
+  const { $, svg, posted, previews, stroke, keyboardStroke, settle, flushPreviews } = buildWall({
+    canDraw: false,
+  });
   stroke(1, 9);
   keyboardStroke();
+  await flushPreviews();
   await settle();
   expect(posted.length).toBe(0);
-  expect(svg.querySelectorAll("path:not(.halo)").length).toBe(0);
+  expect(previews.length).toBe(0);
+  // The practice stroke is on this screen only, and can't be added.
+  expect(svg.querySelectorAll("path.mine.draft").length).toBe(1);
+  expect($("publish").disabled).toBe(true);
+  expect($("mode").disabled).toBe(true);
 });
 
 it("posts one mark for a keyboard-only gesture: Enter, an arrow step, Enter", async () => {
@@ -228,7 +264,9 @@ it("refuses a second gesture in the same tab once the first mark has landed", as
   stroke(20, 40);
   await settle();
   expect(posted.length).toBe(1);
-  expect(svg.querySelectorAll("path:not(.halo)").length).toBe(1);
+  // The second is a practice draft beside the landed mark, not a post.
+  expect(svg.querySelectorAll("path:not(.halo)").length).toBe(2);
+  expect(svg.querySelectorAll("path.draft").length).toBe(1);
 });
 
 it("draws another hand's mark even when its path is byte-identical to this tab's own", async () => {
@@ -301,7 +339,7 @@ it("doesn't duplicate its own mark when the SSE echo arrives before the post res
 // --- Live previews -----------------------------------------------------------
 
 it("streams a pointer gesture as a preview while it's drawn, then commits under the same id", async () => {
-  const { gesture, posted, previews, flushPreviews, settle } = buildWall({ canDraw: true });
+  const { gesture, posted, previews, flushPreviews, settle, publish } = buildWall({ canDraw: true });
   gesture(10, 10, "pointerdown");
   gesture(20, 20, "pointermove");
   await flushPreviews();
@@ -318,6 +356,9 @@ it("streams a pointer gesture as a preview while it's drawn, then commits under 
   expect(previews.every((p) => !("nonce" in p) && !("colour" in p))).toBe(true);
 
   gesture(41, 41, "pointerup");
+  await settle();
+  expect(posted.length).toBe(0); // a draft until the hand adds it
+  publish();
   await settle();
   expect(posted.length).toBe(1);
   expect(posted[0].gesture).toBe(id);
@@ -438,7 +479,7 @@ it("streams a keyboard gesture too, and Escape cancels its preview", async () =>
   key("Enter");
   key("ArrowRight");
   await flushPreviews();
-  expect(previews.flatMap((p) => p.points as Point[])).toEqual([[50, 50], [80, 50]]);
+  expect(previews.flatMap((p) => p.points as Point[])).toEqual([[500, 300], [530, 300]]);
   key("Escape");
   await settle();
   expect(cancels.map((c) => c.gesture)).toEqual([previews[0].gesture]);
@@ -456,8 +497,8 @@ it("heartbeats a paused gesture so its preview outlives the lease", async () => 
   expect(previews.at(-1)!.points).toEqual([]);
 });
 
-it("cancels the preview when the mark can't be submitted at all", async () => {
-  const { stroke, cancels, posted, settle, status, svg } = buildWall({
+it("cancels the preview but keeps the drawing when the mark can't be submitted at all", async () => {
+  const { $, stroke, cancels, posted, settle, status, svg, publish } = buildWall({
     canDraw: true,
     networkFail: true,
   });
@@ -467,7 +508,16 @@ it("cancels the preview when the mark can't be submitted at all", async () => {
   expect(posted.length).toBe(1);
   expect(cancels.map((c) => c.gesture)).toEqual([posted[0].gesture]);
   expect(status.textContent).toContain("Couldn't reach the wall");
-  expect(svg.querySelectorAll("path").length).toBe(0);
+  expect(svg.querySelectorAll("path.mine.draft").length).toBe(1);
+  expect($("draft").hidden).toBe(false);
+
+  // Adding it again is the same submission: same nonce, same gesture.
+  publish();
+  await settle();
+  await settle();
+  expect(posted.length).toBe(2);
+  expect(posted[1].nonce).toBe(posted[0].nonce);
+  expect(posted[1].gesture).toBe(posted[0].gesture);
 });
 
 it("on reconnect, catches up on committed marks and resyncs previews without touching local work", async () => {
@@ -499,4 +549,196 @@ it("on reconnect, catches up on committed marks and resyncs previews without tou
   expect(previewPaths().map((p) => p.getAttribute("d"))).toEqual(["M7,7 L8,8"]);
   // This hand's gesture in progress survives the whole thing, on top.
   expect(svg.lastElementChild!.getAttribute("d")).toBe("M10,10 L20,20");
+});
+
+// --- Drafts, private practice and publishing ---------------------------------
+
+it("never streams a stroke unless Draw live was deliberately turned on", async () => {
+  const { gesture, previews, cancels, flushPreviews, $ } = buildWall({ canDraw: true, liveMode: false });
+  expect($("mode").getAttribute("aria-pressed")).toBe("false");
+  gesture(10, 10, "pointerdown");
+  gesture(20, 20, "pointermove");
+  gesture(30, 30, "pointerup");
+  await flushPreviews();
+  expect(previews.length).toBe(0);
+  expect(cancels.length).toBe(0);
+
+  // Turning it on doesn't reach back and share the draft already drawn.
+  $("mode").click();
+  expect($("mode").getAttribute("aria-pressed")).toBe("true");
+  await flushPreviews();
+  expect(previews.length).toBe(0);
+});
+
+it("turning Draw live off mid-stroke takes the stroke off everyone else's screen", async () => {
+  const { gesture, previews, cancels, flushPreviews, $ } = buildWall({ canDraw: true });
+  gesture(10, 10, "pointerdown");
+  gesture(20, 20, "pointermove");
+  await flushPreviews();
+  expect(previews.length).toBeGreaterThan(0);
+  $("mode").click();
+  expect(cancels.map((c) => c.gesture)).toEqual([previews[0].gesture]);
+  gesture(30, 30, "pointermove");
+  await flushPreviews();
+  expect(previews.flatMap((p) => p.points as Point[])).not.toContainEqual([30, 30]);
+});
+
+it("holds a finished live stroke as a dashed preview while its hand decides", async () => {
+  const { gesture, previews, flushPreviews, $ } = buildWall({ canDraw: true, autoPublish: false });
+  gesture(10, 10, "pointerdown");
+  gesture(20, 20, "pointermove");
+  gesture(30, 30, "pointerup");
+  await flushPreviews();
+  expect(previews.at(-1)!.held).toBe(true);
+  expect($("draft").hidden).toBe(false);
+});
+
+it("Try again discards the draft and its preview, posting nothing", async () => {
+  const { gesture, posted, cancels, previews, flushPreviews, settle, svg, $ } = buildWall({
+    canDraw: true,
+    autoPublish: false,
+  });
+  gesture(10, 10, "pointerdown");
+  gesture(20, 20, "pointermove");
+  gesture(30, 30, "pointerup");
+  await flushPreviews();
+  $("retry").click();
+  await settle();
+  expect(posted.length).toBe(0);
+  expect(cancels.map((c) => c.gesture)).toEqual([previews[0].gesture]);
+  expect(svg.querySelectorAll("path").length).toBe(0);
+  expect($("draft").hidden).toBe(true);
+});
+
+it("Escape discards a keyboard draft before it's added", async () => {
+  const { key, posted, svg, settle } = buildWall({ canDraw: true, autoPublish: false });
+  key("Enter");
+  key("ArrowDown");
+  key("Enter"); // now a draft
+  key("Escape");
+  await settle();
+  expect(posted.length).toBe(0);
+  expect(svg.querySelectorAll("path").length).toBe(0);
+});
+
+it("starting a new stroke replaces the waiting draft rather than stacking", async () => {
+  const { stroke, posted, svg, settle } = buildWall({ canDraw: true, autoPublish: false });
+  stroke(10, 20);
+  stroke(30, 40);
+  await settle();
+  expect(posted.length).toBe(0);
+  expect(svg.querySelectorAll("path.mine").length).toBe(1);
+  expect(svg.querySelector("path.mine")!.getAttribute("d")).toBe("M30,30 L40,40");
+});
+
+it("sends the prompt it answered and a private note only when the hand gives them", async () => {
+  const { stroke, posted, settle, $, publish } = buildWall({ canDraw: true, autoPublish: false });
+  stroke(10, 20);
+  ($("note") as unknown as HTMLTextAreaElement).value = "  the queue at the bus stop  ";
+  publish();
+  await settle();
+  expect(posted[0].prompt).toBe(TODAY);
+  expect(posted[0].note).toBe("the queue at the bus stop");
+
+  const skip = buildWall({ canDraw: true, autoPublish: false });
+  skip.stroke(10, 20);
+  skip.$("answers").checked = false;
+  skip.publish();
+  await skip.settle();
+  expect(skip.posted[0].prompt).toBeUndefined();
+  expect(skip.posted[0].note).toBeUndefined();
+});
+
+it("keeps the drawing as practice when the server refuses the mark", async () => {
+  const { stroke, settle, status, svg, $ } = buildWall({ canDraw: true, markStatus: 429 });
+  stroke(1, 9);
+  await settle();
+  await settle();
+  expect(status.textContent).toContain("already on the wall");
+  expect(svg.querySelectorAll("path.mine.draft").length).toBe(1);
+  expect($("publish").disabled).toBe(true);
+  expect($("mode").disabled).toBe(true);
+});
+
+it("turns Draw live back off once a mark lands, and names it by its committed id", async () => {
+  const { stroke, settle, svg, $ } = buildWall({ canDraw: true });
+  stroke(1, 9);
+  await settle();
+  await settle();
+  const mine = svg.querySelector("path.mine")!;
+  expect(mine.classList.contains("draft")).toBe(false);
+  expect(mine.getAttribute("data-id")).toBe("901");
+  expect(mine.getAttribute("data-prompt")).toBe(TODAY);
+  expect($("mode").getAttribute("aria-pressed")).toBe("false");
+  expect($("mode").disabled).toBe(true);
+  expect($("draft").hidden).toBe(true);
+});
+
+const markRow = (id: number, prompt: string | null, hand = "someone-else"): Mark => ({
+  id,
+  hand_id: hand,
+  path: `M${id},1 L${id},2`,
+  colour: "#cc4a28",
+  created_at: id,
+  prompt,
+});
+
+it("points out marks that are new since this browser last looked", () => {
+  const { svg, $ } = buildWall({
+    canDraw: true,
+    marks: [markRow(1, null), markRow(2, null), markRow(3, null), markRow(4, null, "this-hand")],
+    lastSeen: 2,
+  });
+  const freshIds = [...svg.querySelectorAll("path.fresh")].map((p) => p.getAttribute("data-id"));
+  // Mark 4 is this hand's own, so it's not news to them.
+  expect(freshIds).toEqual(["3"]);
+  expect($("fresh").hidden).toBe(false);
+  expect($("fresh").textContent).toContain("One mark is new");
+});
+
+it("dims everything that didn't answer today's prompt, live arrivals included", () => {
+  const { svg, $, window, emitMark } = buildWall({
+    canDraw: true,
+    marks: [markRow(1, TODAY), markRow(2, "a sound you heard this morning"), markRow(3, null)],
+  });
+  $("only-prompt").checked = true;
+  $("only-prompt").dispatchEvent(new window.Event("change"));
+  const dimmed = () => [...svg.querySelectorAll("path.off-prompt")].map((p) => p.getAttribute("data-id"));
+  expect(dimmed()).toEqual(["2", "3"]);
+  emitMark({ id: 10, path: "M1,1 L9,9", colour: "#5177aa", prompt: TODAY } as never);
+  emitMark({ id: 11, path: "M2,2 L8,8", colour: "#5177aa", prompt: null } as never);
+  expect(dimmed()).toEqual(["2", "3", "11"]);
+});
+
+it("takes a deleted mark off the wall live", () => {
+  const { svg, emit } = buildWall({ canDraw: true, marks: [markRow(1, null), markRow(2, null)] });
+  emit("unmark", { id: 1 });
+  expect([...svg.querySelectorAll("path[data-id]")].map((p) => p.getAttribute("data-id"))).toEqual(["2"]);
+});
+
+it("says so when the server refuses its live preview, instead of claiming to be live", async () => {
+  const { gesture, previews, flushPreviews, $ } = buildWall({ canDraw: true, previewStatus: 401 });
+  gesture(10, 10, "pointerdown");
+  gesture(20, 20, "pointermove");
+  await flushPreviews();
+  gesture(30, 30, "pointermove");
+  await flushPreviews();
+  expect(previews.length).toBe(1); // stopped after the refusal
+  expect($("mode-note").textContent).toContain("only on your screen");
+});
+
+it("on a slow connection, coalesces a burst of movement into a few ordered updates, losing nothing", async () => {
+  const { gesture, previews, $ } = buildWall({ canDraw: true, previewDelay: 200 });
+  gesture(0, 0, "pointerdown");
+  for (let i = 1; i <= 60; i++) {
+    gesture(i, i, "pointermove");
+    if (i % 20 === 0) await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  await new Promise((resolve) => setTimeout(resolve, 900));
+  // One request in flight at a time: about one per round trip, not one per move.
+  expect(previews.length).toBeLessThanOrEqual(5);
+  const sent = previews.flatMap((p) => p.points as Point[]);
+  expect(sent).toEqual(Array.from({ length: 61 }, (_, i) => [i, i]));
+  expect(previews.every((p, i) => i === 0 || (p.from as number) >= (previews[i - 1].from as number))).toBe(true);
+  expect($("mode-note").textContent).not.toContain("only on your screen");
 });

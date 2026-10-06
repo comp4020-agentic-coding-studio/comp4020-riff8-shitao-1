@@ -85,6 +85,20 @@ describe("live previews", () => {
     expect(live.snapshot()).toEqual([]);
   });
 
+  it("sweeps a stroke held awaiting its hand's decision once it's waited too long", () => {
+    const live = createLive({ leaseMs: LEASE, heldMaxMs: 60_000 });
+    const g = randomUUID();
+    live.update("hand-a", "#cc4a28", { gesture: g, from: 0, points: [[1, 1], [2, 2]] }, 0);
+    const held = live.update("hand-a", "#cc4a28", { gesture: g, from: 2, points: [], held: true }, 1000);
+    expect(held.ok && held.events[0]).toMatchObject({ type: "preview", held: true, points: [] });
+    // Heartbeats keep it inside the lease, but not past the held limit.
+    for (let t = 4000; t <= 61_000; t += 3000) {
+      live.update("hand-a", "#cc4a28", { gesture: g, from: 2, points: [], held: true }, t);
+      if (t < 61_000) expect(live.sweep(t)).toEqual([]);
+    }
+    expect(live.sweep(61_001)).toEqual([{ type: "preview-end", gesture: g, reason: "expired" }]);
+  });
+
   it("replaces a hand's older preview when the same hand starts a new one", () => {
     const live = createLive({ leaseMs: LEASE });
     const [g1, g2] = [randomUUID(), randomUUID()];

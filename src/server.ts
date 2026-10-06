@@ -1,10 +1,22 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { readFileSync } from "node:fs";
 import { extname, join } from "node:path";
-import { addMark, allMarks, createHand, getHand, msUntilNextMark } from "./db.ts";
+import {
+  addMark,
+  allMarks,
+  createHand,
+  deleteMark,
+  getHand,
+  MARK_INTERVAL_MS,
+  markByNonce,
+  msUntilNextMark,
+  ownMarks,
+  setNote,
+} from "./db.ts";
 import { createLive, type LiveEvent } from "./live.ts";
 import { colourFor, nameFor, newHandId, parseHandCookie, setHandCookie } from "./identity.ts";
-import { readmePage, untilPhrase, wallPage } from "./pages.ts";
+import { keepsakeSvg, minePage, readmePage, untilPhrase, wallPage } from "./pages.ts";
+import { isPrompt, promptFor } from "./prompts.ts";
 
 const PORT = Number(process.env.PORT ?? 8080);
 // Fly's proxy terminates TLS and forwards plain http; FLY_APP_NAME is only
@@ -96,11 +108,29 @@ function broadcastLive(events: LiveEvent[]): void {
 // The gesture id lets viewers swap a preview for its committed stroke in
 // place. Nothing a tab sends to prove who it is (the cookie, a submission
 // nonce) ever goes out over this stream.
-function broadcastMark(mark: { id: number; path: string; colour: string; gesture?: string }): void {
-  send("mark", { id: mark.id, path: mark.path, colour: mark.colour, gesture: mark.gesture });
+function broadcastMark(mark: {
+  id: number;
+  path: string;
+  colour: string;
+  prompt: string | null;
+  gesture?: string;
+}): void {
+  send("mark", {
+    id: mark.id,
+    path: mark.path,
+    colour: mark.colour,
+    prompt: mark.prompt,
+    gesture: mark.gesture,
+  });
 }
 
 setInterval(() => broadcastLive(live.sweep()), 1000).unref();
+
+// Private to the hand that writes it: stored beside the mark, shown only on
+// that hand's /mine/ page and its own export, never on the wall, in
+// /api/marks or over SSE.
+const NOTE_MAX = 500;
+const NONCE_RE = /^[A-Za-z0-9-]{8,64}$/;
 
 const json = (res: ServerResponse, status: number, body: unknown) => {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -114,7 +144,7 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/") {
       const hand = ensureHand(req, res);
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(wallPage(allMarks(), hand, msUntilNextMark(hand.id), PREVIEW_LEASE_MS));
+      res.end(wallPage(allMarks(), hand, msUntilNextMark(hand.id), PREVIEW_LEASE_MS, promptFor()));
       return;
     }
 
@@ -156,7 +186,13 @@ const server = createServer(async (req, res) => {
       json(
         res,
         200,
-        allMarks().map((m) => ({ id: m.id, path: m.path, colour: m.colour, mine: m.hand_id === handId })),
+        allMarks().map((m) => ({
+          id: m.id,
+          path: m.path,
+          colour: m.colour,
+          prompt: m.prompt,
+          mine: m.hand_id === handId,
+        })),
       );
       return;
     }
@@ -209,17 +245,18 @@ const server = createServer(async (req, res) => {
       const hand = ensureHand(req, res);
 
       const raw = await readBody(req);
-      let path: unknown;
-      let gesture: unknown;
+      let body: { path?: unknown; gesture?: unknown; nonce?: unknown; prompt?: unknown; note?: unknown };
       try {
-        const body = JSON.parse(raw) as { path?: unknown; gesture?: unknown };
-        path = body.path;
-        gesture = body.gesture;
+        body = JSON.parse(raw);
+        if (typeof body !== "object" || body === null) throw new Error("not an object");
       } catch {
         res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
         res.end("Malformed request.");
         return;
       }
+      const { path, gesture } = body;
+      const nonce = typeof body.nonce === "string" && NONCE_RE.test(body.nonce) ? body.nonce : null;
+      const prompt = isPrompt(body.prompt) ? body.prompt : null;
 
       if (typeof path !== "string" || !PATH_RE.test(path)) {
         broadcastLive(live.cancel(hand.id, gesture));
@@ -227,6 +264,22 @@ const server = createServer(async (req, res) => {
         res.end("That doesn't look like a mark.");
         return;
       }
+      if (body.note !== undefined && (typeof body.note !== "string" || body.note.length > NOTE_MAX)) {
+        broadcastLive(live.cancel(hand.id, gesture));
+        res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end(`A note can be up to ${NOTE_MAX} characters.`);
+        return;
+      }
+
+      // A retry of a submission that already landed (its response lost on
+      // the way back): answer as if it had just succeeded, and change
+      // nothing. The original already broadcast.
+      const existing = nonce ? markByNonce(hand.id, nonce) : undefined;
+      if (existing) {
+        json(res, 201, { id: existing.id, nextAt: existing.created_at + MARK_INTERVAL_MS });
+        return;
+      }
+
       // The check has to be the last thing before the insert, with no
       // `await` between them: a client that holds its request body open
       // (a slow POST, or just a second tab) can otherwise pass this check
@@ -241,11 +294,72 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      const mark = addMark(hand.id, path, hand.colour);
+      const mark = addMark(hand.id, path, hand.colour, Date.now(), { prompt, nonce });
+      if (typeof body.note === "string") setNote(hand.id, mark.id, body.note);
       broadcastMark({ ...mark, gesture: live.commit(hand.id, gesture) });
-      res.writeHead(201, { "Content-Type": "text/plain; charset=utf-8" });
-      res.end("ok");
+      json(res, 201, { id: mark.id, nextAt: mark.created_at + MARK_INTERVAL_MS });
       return;
+    }
+
+    // --- My traces: everything here is about the requesting hand only. -----
+
+    if (url.pathname.startsWith("/mine/")) {
+      const hand = existingHand(req);
+      if (req.method === "GET" && url.pathname === "/mine/") {
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        const flash = url.searchParams.has("saved")
+          ? "Note saved."
+          : url.searchParams.has("deleted")
+            ? "Deleted: that mark is off the wall and its note is gone."
+            : "";
+        res.end(minePage(hand ? ownMarks(hand.id) : [], hand ? msUntilNextMark(hand.id) : 0, flash));
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/mine/export.json" && hand) {
+        const marks = ownMarks(hand.id).map((m) => ({
+          drawn_at: new Date(m.created_at).toISOString(),
+          path: m.path,
+          colour: m.colour,
+          prompt: m.prompt,
+          note: m.note,
+        }));
+        res.writeHead(200, {
+          "Content-Type": "application/json; charset=utf-8",
+          "Content-Disposition": 'attachment; filename="my-traces.json"',
+        });
+        res.end(JSON.stringify({ exported_at: new Date().toISOString(), marks }, null, 2));
+        return;
+      }
+      const keepsake = url.pathname.match(/^\/mine\/marks\/(\d+)\.svg$/);
+      if (req.method === "GET" && keepsake && hand) {
+        const mark = ownMarks(hand.id).find((m) => m.id === Number(keepsake[1]));
+        if (mark) {
+          res.writeHead(200, {
+            "Content-Type": "image/svg+xml; charset=utf-8",
+            "Content-Disposition": `attachment; filename="trace-${mark.id}.svg"`,
+          });
+          res.end(keepsakeSvg(mark));
+          return;
+        }
+      }
+      const action = url.pathname.match(/^\/mine\/marks\/(\d+)\/(note|delete)$/);
+      if (req.method === "POST" && action && hand) {
+        const markId = Number(action[1]);
+        const form = new URLSearchParams(await readBody(req, 4_000));
+        if (action[2] === "note") {
+          const note = form.get("note") ?? "";
+          if (note.length <= NOTE_MAX && setNote(hand.id, markId, note)) {
+            res.writeHead(303, { Location: `/mine/?saved=${markId}#mark-${markId}` });
+            res.end();
+            return;
+          }
+        } else if (deleteMark(hand.id, markId)) {
+          send("unmark", { id: markId });
+          res.writeHead(303, { Location: "/mine/?deleted=1" });
+          res.end();
+          return;
+        }
+      }
     }
 
     res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });

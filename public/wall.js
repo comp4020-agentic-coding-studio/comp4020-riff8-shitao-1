@@ -1,5 +1,6 @@
-// Captures one pointer gesture on the wall's SVG and posts it as a mark,
-// streams it as a live preview while it's being drawn, and listens over SSE
+// Captures a gesture on the wall's SVG as a private draft, adds it to the
+// wall only when the hand says so, streams it as a live preview while it's
+// drawn if (and only if) the hand turned Draw live on, and listens over SSE
 // for everyone's previews and finished marks so the wall updates with no
 // reload. No frameworks: this is the whole client.
 (() => {
@@ -8,9 +9,26 @@
   const svg = document.getElementById("wall");
   const status = document.getElementById("status");
   const connection = document.getElementById("connection");
+  const draftForm = document.getElementById("draft");
+  const publishButton = document.getElementById("publish");
+  const retryButton = document.getElementById("retry");
+  const answers = document.getElementById("answers");
+  const note = document.getElementById("note");
+  const modeButton = document.getElementById("mode");
+  const modeNote = document.getElementById("mode-note");
+  const onlyPrompt = document.getElementById("only-prompt");
+  const fresh = document.getElementById("fresh");
   const handColour = script.dataset.handColour;
   const previewLease = Number(script.dataset.previewLease ?? 5000);
-  let canDraw = script.dataset.canDraw === "true";
+  const todayPrompt = script.dataset.prompt ?? "";
+  // Whether this hand can add a mark right now. Drawing itself is always
+  // open: during the cooldown it's private practice that can't be added.
+  let canPublish = script.dataset.canDraw === "true";
+  // Off by default, and off again after every mark: nobody streams their
+  // drawing without having just chosen to.
+  let liveMode = false;
+  // The finished gesture waiting for Add to the wall or Try again.
+  let draft = null;
   let points = [];
   let live = null;
   let drawing = false;
@@ -47,8 +65,25 @@
   // own strokes and the one it's drawing right now, which stay on top.
   const insertUnderOwn = (el) => svg.insertBefore(el, svg.querySelector(".halo, .mine"));
 
-  const appendStroke = (path, colour, id) =>
-    insertUnderOwn(makePath({ d: path, stroke: colour, "data-id": id }));
+  const appendStroke = (path, colour, id, prompt) => {
+    const el = makePath({ d: path, stroke: colour, "data-id": id, "data-prompt": prompt ?? undefined });
+    insertUnderOwn(el);
+    applyFilter(el);
+  };
+
+  // "Only today's prompt" dims every committed stroke that answered
+  // something else (or nothing), so a hand can see how others answered.
+  const applyFilter = (el) =>
+    el.classList.toggle(
+      "off-prompt",
+      Boolean(onlyPrompt?.checked) && el.getAttribute("data-prompt") !== todayPrompt,
+    );
+  const filterAll = () => {
+    for (const el of svg.querySelectorAll("path[data-id]:not(.halo)")) applyFilter(el);
+  };
+  onlyPrompt?.addEventListener("change", filterAll);
+  // A reload can restore the box already ticked.
+  filterAll();
 
   // The stroke being drawn, over its halo, mirroring what the server renders
   // for a hand's own marks.
@@ -79,13 +114,22 @@
       const res = await fetch("/api/strokes/live", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ gesture: s.id, from: s.sent, points: pts }),
+        body: JSON.stringify({ gesture: s.id, from: s.sent, points: pts, held: s.held }),
       });
       const body = await res.json().catch(() => ({}));
       if (typeof body.count === "number") s.sent = body.count;
-      // Gone, refused or not ours: stop streaming this gesture. The mark
-      // itself can still be posted; it just won't have been watched.
-      if (!res.ok && res.status !== 409 && res.status !== 429) s.stopped = true;
+      // Gone, refused or not ours: stop streaming this gesture, and say so
+      // rather than keep claiming it's live. The mark itself can still be
+      // added; it just won't have been watched.
+      if (!res.ok && res.status !== 409 && res.status !== 429) {
+        s.stopped = true;
+        if (res.status !== 410 && modeNote && sender === s) {
+          modeNote.textContent =
+            res.status === 503
+              ? "Too many people are drawing live right now, so this line is only on your screen."
+              : "Live drawing isn't reaching anyone (reload the page to try again), so this line is only on your screen.";
+        }
+      }
     } catch {
       // A dropped request: the next send resumes from the last count the
       // server confirmed, so nothing is skipped or doubled.
@@ -102,7 +146,7 @@
   };
 
   const startSender = (id, pts) => {
-    const s = { id, points: pts, sent: 0, inFlight: false, timer: null, lastSentAt: 0, stopped: false, beat: false };
+    const s = { id, points: pts, sent: 0, inFlight: false, timer: null, lastSentAt: 0, stopped: false, beat: false, held: false };
     s.heartbeat = setInterval(() => {
       s.beat = true;
       schedule(s);
@@ -145,15 +189,37 @@
 
   // --- Drawing ------------------------------------------------------------
 
+  const nextAtPhrase = (at) =>
+    `from ${new Date(at).toLocaleString([], { weekday: "long", hour: "numeric", minute: "2-digit" })}`;
+
+  const describeMode = () => {
+    if (!modeButton) return;
+    if (!canPublish) liveMode = false;
+    modeButton.disabled = !canPublish;
+    modeButton.setAttribute("aria-pressed", String(liveMode));
+    modeButton.textContent = liveMode ? "Draw live: on" : "Draw live";
+    modeNote.textContent = !canPublish
+      ? "Live drawing opens again when you can add your next mark."
+      : liveMode
+        ? "On: everyone on the wall watches your line as you draw it, before you decide whether to add it."
+        : "Off: you're practising privately. Turn it on to let everyone here watch your line as you draw it.";
+  };
+
+  const showDraft = (show) => {
+    if (draftForm) draftForm.hidden = !show;
+    if (publishButton) publishButton.disabled = !canPublish;
+  };
+
   const beginGesture = (point) => {
+    if (draft) discardDraft();
     drawing = true;
     points = [point];
     gesture = crypto.randomUUID();
     ownGestures.add(gesture);
     halo = makePath({ class: "halo" });
-    live = makePath({ stroke: handColour, class: "mine" });
+    live = makePath({ stroke: handColour, class: "mine draft" });
     svg.append(halo, live);
-    startSender(gesture, points);
+    if (liveMode && canPublish) startSender(gesture, points);
   };
 
   const addPoint = (point) => {
@@ -174,101 +240,177 @@
     dropLive();
   };
 
-  if (canDraw) {
-    svg.addEventListener("pointerdown", (evt) => {
-      if (!canDraw || submitting) return;
-      beginGesture(toViewBox(evt));
-      svg.setPointerCapture(evt.pointerId);
-    });
+  function discardDraft() {
+    draft = null;
+    showDraft(false);
+    stopSender(true);
+    dropLive();
+  }
 
-    svg.addEventListener("pointermove", (evt) => {
-      if (!drawing) return;
-      addPoint(toViewBox(evt));
-    });
+  const finish = () => {
+    if (!drawing) return;
+    drawing = false;
+    if (points.length < 2) {
+      cancelGesture();
+      return;
+    }
+    // Chosen once per draft, so a retry after a lost response is
+    // recognised by the server as the same submission, not a second mark.
+    draft = { gesture, points, nonce: crypto.randomUUID() };
+    if (sender) {
+      sender.held = true;
+      sender.beat = true;
+      schedule(sender);
+    }
+    showDraft(true);
+    const audience = document.getElementById("draft-audience");
+    if (audience) {
+      audience.textContent = sender
+        ? "Everyone watching the wall sees it dashed until you add it or try again."
+        : "Only you can see it.";
+    }
+    status.textContent = canPublish
+      ? `Not on the wall yet${sender ? " (people watching see it dashed, waiting)" : ""}: add it, or try again. Escape discards it.`
+      : "That one's just for practice: you can add your next mark once the day is up.";
+  };
 
-    const finish = async () => {
-      if (!drawing) return;
-      drawing = false;
-      if (points.length < 2) {
-        cancelGesture();
-        return;
-      }
-      const path = pathFrom(points);
-      const committing = gesture;
-      stopSender(false);
-      submitting = true;
-      status.textContent = "Adding your mark…";
-      try {
-        const res = await fetch("/api/marks", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ path, gesture: committing }),
-        });
-        if (!res.ok) {
-          const text = await res.text();
-          status.textContent = text || "That mark wasn't accepted.";
-          dropLive();
-          return;
+  const publish = async () => {
+    if (!draft || submitting || !canPublish) return;
+    const { gesture: committing, points: pts, nonce } = draft;
+    stopSender(false);
+    submitting = true;
+    publishButton.disabled = true;
+    status.textContent = "Adding your mark…";
+    try {
+      const res = await fetch("/api/marks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          path: pathFrom(pts),
+          gesture: committing,
+          nonce,
+          prompt: answers?.checked ? todayPrompt : undefined,
+          note: note?.value.trim() ? note.value.trim() : undefined,
+        }),
+      });
+      if (!res.ok) {
+        // Refused (already marked today, or a bad stroke): the server has
+        // ended the preview, but the drawing stays here as practice.
+        const text = await res.text();
+        status.textContent = text || "That mark wasn't accepted.";
+        if (res.status === 429) {
+          canPublish = false;
+          describeMode();
         }
-        canDraw = false;
-        status.textContent =
-          "Your mark is on the wall: the thicker stroke, on top. You can add another in 24 hours.";
-      } catch {
-        // The server never answered, so it may or may not have the preview:
-        // cancel it explicitly rather than leave it to the lease.
-        status.textContent = "Couldn't reach the wall --- try again.";
-        cancelPreview(committing);
-        dropLive();
-      } finally {
-        submitting = false;
+        return;
       }
-    };
+      const body = await res.json().catch(() => ({}));
+      const keptNote = Boolean(note?.value.trim());
+      if (body.id !== undefined) {
+        live.setAttribute("data-id", body.id);
+        halo.setAttribute("data-id", body.id);
+      }
+      if (answers?.checked) live.setAttribute("data-prompt", todayPrompt);
+      live.classList.remove("draft");
+      draft = null;
+      if (note) note.value = "";
+      canPublish = false;
+      describeMode();
+      showDraft(false);
+      status.textContent = `Your mark is on the wall: the thicker stroke, on top. My traces keeps it${keptNote ? " with your note" : ""}. You can add your next one ${body.nextAt ? nextAtPhrase(body.nextAt) : "in 24 hours"}.`;
+    } catch {
+      // The server never answered. Cancel the preview rather than leave it
+      // to the lease; the draft stays, and adding it again reuses its nonce.
+      cancelPreview(committing);
+      status.textContent = "Couldn't reach the wall. Your drawing is still here: try adding it again.";
+    } finally {
+      submitting = false;
+      if (publishButton) publishButton.disabled = !canPublish;
+    }
+  };
 
-    svg.addEventListener("pointerup", finish);
-    // The system took the pointer away (a scroll, a palm, a notification):
-    // that's not the hand choosing to finish, so nothing is posted.
-    svg.addEventListener("pointercancel", () => {
+  svg.addEventListener("pointerdown", (evt) => {
+    if (submitting) return;
+    beginGesture(toViewBox(evt));
+    svg.setPointerCapture(evt.pointerId);
+  });
+
+  svg.addEventListener("pointermove", (evt) => {
+    if (!drawing) return;
+    addPoint(toViewBox(evt));
+  });
+
+  svg.addEventListener("pointerup", finish);
+  // The system took the pointer away (a scroll, a palm, a notification):
+  // that's not the hand choosing to finish, so nothing is kept.
+  svg.addEventListener("pointercancel", () => {
+    if (drawing) cancelGesture();
+  });
+
+  // A pointer is the only way to draw unless this exists: Enter/Space
+  // starts a gesture at the wall's centre, the arrow keys add a point each
+  // in that direction (mirroring pointermove), and Enter/Space again
+  // finishes it into a draft, the same as lifting a pointer. Escape cancels
+  // a gesture or discards a draft.
+  const STEP = 30;
+  const ARROW_DELTAS = {
+    ArrowUp: [0, -STEP],
+    ArrowDown: [0, STEP],
+    ArrowLeft: [-STEP, 0],
+    ArrowRight: [STEP, 0],
+  };
+  svg.addEventListener("keydown", (evt) => {
+    if (submitting) return;
+    if (evt.key === "Escape" && (drawing || draft)) {
+      evt.preventDefault();
       if (drawing) cancelGesture();
-    });
+      else discardDraft();
+      status.textContent = "Discarded. Nothing was added.";
+      return;
+    }
+    if (!drawing) {
+      if (evt.key !== "Enter" && evt.key !== " ") return;
+      evt.preventDefault();
+      const vb = svg.viewBox.baseVal;
+      beginGesture([Math.round(vb.x + vb.width / 2), Math.round(vb.y + vb.height / 2)]);
+      return;
+    }
+    if (evt.key in ARROW_DELTAS) {
+      evt.preventDefault();
+      const [dx, dy] = ARROW_DELTAS[evt.key];
+      const [x, y] = points[points.length - 1];
+      addPoint([x + dx, y + dy]);
+      return;
+    }
+    if (evt.key === "Enter" || evt.key === " ") {
+      evt.preventDefault();
+      finish();
+    }
+  });
 
-    // A pointer is the only way to draw unless this exists: Enter/Space
-    // starts a gesture at the wall's centre, the arrow keys add a point each
-    // in that direction (mirroring pointermove), and Enter/Space again hands
-    // off to the same finish() a pointer gesture uses. Escape cancels, the
-    // same way lifting a pointer after barely moving does.
-    const STEP = 30;
-    const ARROW_DELTAS = {
-      ArrowUp: [0, -STEP],
-      ArrowDown: [0, STEP],
-      ArrowLeft: [-STEP, 0],
-      ArrowRight: [STEP, 0],
-    };
-    svg.addEventListener("keydown", (evt) => {
-      if (!canDraw || submitting) return;
-      if (!drawing) {
-        if (evt.key !== "Enter" && evt.key !== " ") return;
-        evt.preventDefault();
-        const vb = svg.viewBox.baseVal;
-        beginGesture([Math.round(vb.x + vb.width / 2), Math.round(vb.y + vb.height / 2)]);
-        return;
-      }
-      if (evt.key in ARROW_DELTAS) {
-        evt.preventDefault();
-        const [dx, dy] = ARROW_DELTAS[evt.key];
-        const [x, y] = points[points.length - 1];
-        addPoint([x + dx, y + dy]);
-        return;
-      }
-      if (evt.key === "Enter" || evt.key === " ") {
-        evt.preventDefault();
-        finish();
-        return;
-      }
-      if (evt.key === "Escape") {
-        evt.preventDefault();
-        cancelGesture();
-      }
-    });
+  draftForm?.addEventListener("submit", (evt) => {
+    evt.preventDefault();
+    publish();
+  });
+  retryButton?.addEventListener("click", () => {
+    discardDraft();
+    status.textContent = "Cleared. Draw again whenever you're ready.";
+    svg.focus();
+  });
+  modeButton?.addEventListener("click", () => {
+    liveMode = !liveMode;
+    // Turning live off mid-stroke takes the stroke off everyone else's
+    // screen; turning it on never reaches back to share a stroke already
+    // drawn in private.
+    if (!liveMode) stopSender(true);
+    describeMode();
+  });
+  describeMode();
+
+  const nextAt = document.getElementById("next-at");
+  if (nextAt) {
+    const hours = nextAt.textContent.match(/\(([^)]*)\)/)?.[1];
+    nextAt.textContent = `${nextAtPhrase(nextAt.getAttribute("datetime"))}${hours ? ` (${hours})` : ""}`;
   }
 
   // --- Watching everyone else ---------------------------------------------
@@ -337,10 +479,13 @@
       r.el.classList.remove("preview", "held");
       r.el.setAttribute("d", mark.path);
       r.el.setAttribute("data-id", mark.id);
+      if (mark.prompt) r.el.setAttribute("data-prompt", mark.prompt);
+      applyFilter(r.el);
       describeLive();
     } else {
-      appendStroke(mark.path, mark.colour, mark.id);
+      appendStroke(mark.path, mark.colour, mark.id, mark.prompt);
     }
+    rememberSeen(mark.id);
     if (mark.gesture) endedRemote.add(mark.gesture);
   };
 
@@ -365,17 +510,61 @@
       if (m.mine) {
         // On top of everyone else's, but still under a stroke in progress.
         const inProgress = halo?.isConnected && !halo.hasAttribute("data-id") ? halo : null;
-        for (const el of [
-          makePath({ d: m.path, class: "halo", "data-id": m.id }),
-          makePath({ d: m.path, stroke: m.colour, class: "mine", "data-id": m.id }),
-        ]) {
-          svg.insertBefore(el, inProgress);
-        }
+        const stroke = makePath({
+          d: m.path,
+          stroke: m.colour,
+          class: "mine",
+          "data-id": m.id,
+          "data-prompt": m.prompt ?? undefined,
+        });
+        svg.insertBefore(makePath({ d: m.path, class: "halo", "data-id": m.id }), inProgress);
+        svg.insertBefore(stroke, inProgress);
+        applyFilter(stroke);
       } else {
-        appendStroke(m.path, m.colour, m.id);
+        appendStroke(m.path, m.colour, m.id, m.prompt);
       }
     }
   };
+
+  // --- What changed since the last visit ---------------------------------
+  //
+  // The highest mark id this browser has seen, kept only in this browser:
+  // the server never learns when anyone looked.
+  const SEEN_KEY = "trace:last-seen";
+  const storage = (() => {
+    try {
+      return window.localStorage;
+    } catch {
+      return null; // storage blocked: just skip the highlight
+    }
+  })();
+  const readSeen = () => {
+    try {
+      return Number(storage?.getItem(SEEN_KEY) ?? NaN);
+    } catch {
+      return NaN;
+    }
+  };
+  function rememberSeen(id) {
+    try {
+      if (!(readSeen() >= Number(id))) storage?.setItem(SEEN_KEY, String(id));
+    } catch {
+      // storage full or blocked
+    }
+  }
+  const committed = [...svg.querySelectorAll("path[data-id]:not(.halo)")];
+  const lastSeen = readSeen();
+  if (Number.isFinite(lastSeen)) {
+    const unseen = committed.filter(
+      (el) => Number(el.getAttribute("data-id")) > lastSeen && !el.classList.contains("mine"),
+    );
+    for (const el of unseen) el.classList.add("fresh");
+    if (fresh && unseen.length > 0) {
+      fresh.hidden = false;
+      fresh.textContent = `${unseen.length === 1 ? "One mark is" : `${unseen.length} marks are`} new since you were last here, drawn wider.`;
+    }
+  }
+  rememberSeen(Math.max(0, ...committed.map((el) => Number(el.getAttribute("data-id")))));
 
   let streamOpen = false;
   let opened = false;
@@ -408,6 +597,11 @@
     stream.addEventListener("preview", (evt) => showPreview(JSON.parse(evt.data)));
     stream.addEventListener("preview-end", (evt) => endPreview(JSON.parse(evt.data).gesture));
     stream.addEventListener("mark", (evt) => showMark(JSON.parse(evt.data)));
+    // A hand deleted one of its marks from My traces.
+    stream.addEventListener("unmark", (evt) => {
+      const { id } = JSON.parse(evt.data);
+      for (const el of svg.querySelectorAll(`[data-id="${id}"]`)) el.remove();
+    });
   };
   connect();
 })();

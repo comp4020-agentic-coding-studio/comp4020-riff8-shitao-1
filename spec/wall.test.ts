@@ -472,3 +472,151 @@ it("bounds preview payloads and rejects bad coordinates", async () => {
   const res = await previewUpdate(hand.cookie, huge).catch(() => undefined);
   expect(res === undefined || res.status === 400).toBe(true);
 });
+
+// --- The sketchbook: prompts, private notes, My traces -----------------------
+
+const postMark = (cookie: string, body: object) =>
+  fetch(new URL("/api/marks", baseUrl), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify(body),
+  });
+
+const todaysPrompt = async () => {
+  const html = await (await fetch(new URL("/", baseUrl))).text();
+  return new JSDOM(html).window.document.getElementById("today")!.textContent!;
+};
+
+const minePage = async (cookie: string) =>
+  (await fetch(new URL("/mine/", baseUrl), { headers: { Cookie: cookie } })).text();
+
+it("keeps a mark's note private to its hand: never on the wall, the API or the stream", async () => {
+  const stream = await openStream();
+  const owner = await freshHand();
+  const other = await freshHand();
+  const note = `the bus was late again ${randomUUID()}`;
+  const path = `M${Date.now() % 100_000},60 L61,62`;
+  const res = await postMark(owner.cookie, { path, prompt: await todaysPrompt(), note });
+  expect(res.status).toBe(201);
+  const { id } = await res.json();
+  await stream.next("mark", (d) => d.id === id);
+
+  expect(await minePage(owner.cookie)).toContain(note);
+  expect(await minePage(other.cookie)).not.toContain(note);
+  for (const cookie of [owner.cookie, other.cookie]) {
+    const wall = await (await fetch(new URL("/", baseUrl), { headers: { Cookie: cookie } })).text();
+    expect(wall).not.toContain(note);
+    const api = await (await fetch(new URL("/api/marks", baseUrl), { headers: { Cookie: cookie } })).text();
+    expect(api).not.toContain(note);
+  }
+  expect(JSON.stringify(stream.seen)).not.toContain(note);
+  stream.close();
+});
+
+it("records the prompt a mark answered, and only ever a real prompt", async () => {
+  const prompt = await todaysPrompt();
+  const a = await freshHand();
+  const b = await freshHand();
+  const answered = await (await postMark(a.cookie, { path: "M70,70 L71,71", prompt })).json();
+  const freeText = await (await postMark(b.cookie, { path: "M72,72 L73,73", prompt: "anything I like" })).json();
+  const marks = (await (await fetch(new URL("/api/marks", baseUrl))).json()) as { id: number; prompt: string | null }[];
+  expect(marks.find((m) => m.id === answered.id)!.prompt).toBe(prompt);
+  expect(marks.find((m) => m.id === freeText.id)!.prompt).toBeNull();
+});
+
+it("treats a retried submission as the same mark, not a second one", async () => {
+  const stream = await openStream();
+  const hand = await freshHand();
+  const nonce = randomUUID();
+  const path = `M${Date.now() % 100_000},80 L81,82`;
+  const first = await postMark(hand.cookie, { path, nonce });
+  const retry = await postMark(hand.cookie, { path, nonce });
+  expect(first.status).toBe(201);
+  expect(retry.status).toBe(201);
+  const [a, b] = [await first.json(), await retry.json()];
+  expect(b.id).toBe(a.id);
+  expect(typeof a.nextAt).toBe("number");
+  expect((await committedPaths()).filter((p) => p === path).length).toBe(1);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  expect(stream.seen.filter((e) => e.event === "mark" && e.data.path === path).length).toBe(1);
+  // A different nonce is a genuinely new attempt, and today is spent.
+  expect((await postMark(hand.cookie, { path, nonce: randomUUID() })).status).toBe(429);
+  stream.close();
+});
+
+it("rejected attempts don't spend the day", async () => {
+  const hand = await freshHand();
+  expect((await postMark(hand.cookie, { path: "not a path" })).status).toBe(400);
+  expect((await postMark(hand.cookie, { path: "M1,1 L2,2", note: "x".repeat(501) })).status).toBe(400);
+  expect((await postMark(hand.cookie, { path: "M1,1 L2,2" })).status).toBe(201);
+});
+
+it("lets only the hand that drew a mark edit its note or delete it", async () => {
+  const owner = await freshHand();
+  const other = await freshHand();
+  const { id } = await (await postMark(owner.cookie, { path: `M${Date.now() % 100_000},90 L91,92` })).json();
+  const form = (cookie: string, action: string, body: Record<string, string> = {}) =>
+    fetch(new URL(`/mine/marks/${id}/${action}`, baseUrl), {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded", Cookie: cookie },
+      body: new URLSearchParams(body),
+      redirect: "manual",
+    });
+
+  expect((await form(other.cookie, "note", { note: "hijacked" })).status).toBe(404);
+  expect((await form(other.cookie, "delete")).status).toBe(404);
+
+  const saved = await form(owner.cookie, "note", { note: "a later reflection" });
+  expect(saved.status).toBe(303);
+  expect(saved.headers.get("location")).toBe(`/mine/?saved=${id}#mark-${id}`);
+  expect(await minePage(owner.cookie)).toContain("a later reflection");
+  // A blank note deletes it.
+  await form(owner.cookie, "note", { note: "" });
+  expect(await minePage(owner.cookie)).not.toContain("a later reflection");
+});
+
+it("deleting a mark takes it off every wall, live, without handing back the day", async () => {
+  const stream = await openStream();
+  const hand = await freshHand();
+  const path = `M${Date.now() % 100_000},95 L96,97`;
+  const { id } = await (await postMark(hand.cookie, { path, note: "gone soon" })).json();
+  const del = await fetch(new URL(`/mine/marks/${id}/delete`, baseUrl), {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded", Cookie: hand.cookie },
+    body: new URLSearchParams(),
+    redirect: "manual",
+  });
+  expect(del.status).toBe(303);
+  expect(await stream.next("unmark", (d) => d.id === id)).toEqual({ id });
+  expect(await committedPaths()).not.toContain(path);
+  expect(await minePage(hand.cookie)).not.toContain("gone soon");
+  expect((await postMark(hand.cookie, { path: "M1,1 L3,3" })).status).toBe(429);
+  stream.close();
+});
+
+it("exports a hand's own marks and notes, and keeps each mark as a standalone image", async () => {
+  const owner = await freshHand();
+  const other = await freshHand();
+  const note = `exported ${randomUUID()}`;
+  const path = `M${Date.now() % 100_000},40 L41,42`;
+  const { id } = await (await postMark(owner.cookie, { path, note })).json();
+
+  const exp = await fetch(new URL("/mine/export.json", baseUrl), { headers: { Cookie: owner.cookie } });
+  expect(exp.headers.get("content-disposition")).toContain("attachment");
+  const data = await exp.json();
+  expect(data.marks).toEqual([expect.objectContaining({ path, note, colour: owner.colour })]);
+  expect(JSON.stringify(data)).not.toContain(owner.cookie.split("=")[1]);
+
+  const otherExport = await (
+    await fetch(new URL("/mine/export.json", baseUrl), { headers: { Cookie: other.cookie } })
+  ).json();
+  expect(otherExport.marks).toEqual([]);
+
+  const svg = await fetch(new URL(`/mine/marks/${id}.svg`, baseUrl), { headers: { Cookie: owner.cookie } });
+  expect(svg.headers.get("content-type")).toMatch(/image\/svg\+xml/);
+  const text = await svg.text();
+  expect(text).toContain(`d="${path}"`);
+  expect(text).not.toContain(note);
+  const stranger = await fetch(new URL(`/mine/marks/${id}.svg`, baseUrl), { headers: { Cookie: other.cookie } });
+  expect(stranger.status).toBe(404);
+});

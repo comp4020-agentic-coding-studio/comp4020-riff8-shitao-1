@@ -27,6 +27,8 @@ interface Preview {
   colour: string;
   points: Point[];
   held: boolean;
+  // When the stroke was finished into a draft awaiting Add to the wall.
+  heldSince: number | null;
   updatedAt: number;
 }
 
@@ -58,7 +60,10 @@ const validPoint = (p: unknown): p is Point =>
   p.length === 2 &&
   p.every((n) => Number.isInteger(n) && n >= LIMITS.coordMin && n <= LIMITS.coordMax);
 
-export function createLive({ leaseMs }: { leaseMs: number }) {
+// A finished stroke waiting on its hand's decision is shown dashed, kept
+// alive by heartbeats --- but not forever: after heldMaxMs it's swept like
+// any abandoned preview, and the draft stays private on the hand's screen.
+export function createLive({ leaseMs, heldMaxMs = 120_000 }: { leaseMs: number; heldMaxMs?: number }) {
   const active = new Map<string, Preview>();
   const ended = new Map<string, { handId: string; at: number }>();
   // Per hand, not per gesture, so minting fresh gesture ids can't dodge it:
@@ -124,7 +129,7 @@ export function createLive({ leaseMs }: { leaseMs: number }) {
         if (active.size >= LIMITS.activeGestures) {
           return { ok: false, status: 503, reason: "too many people drawing right now" };
         }
-        preview = { gesture, handId, colour, points: [], held, updatedAt: now };
+        preview = { gesture, handId, colour, points: [], held, heldSince: null, updatedAt: now };
         active.set(gesture, preview);
       }
 
@@ -140,6 +145,7 @@ export function createLive({ leaseMs }: { leaseMs: number }) {
       preview.updatedAt = now;
       const heldChanged = preview.held !== held;
       preview.held = held;
+      preview.heldSince = held ? (preview.heldSince ?? now) : null;
       if (fresh.length > 0 || heldChanged || count === 0) {
         events.push({ type: "preview", gesture, colour: preview.colour, from: count, points: fresh, held });
       }
@@ -177,7 +183,8 @@ export function createLive({ leaseMs }: { leaseMs: number }) {
     sweep(now = Date.now()): LiveEvent[] {
       const events: LiveEvent[] = [];
       for (const preview of active.values()) {
-        if (now - preview.updatedAt > leaseMs) {
+        const heldTooLong = preview.heldSince !== null && now - preview.heldSince > heldMaxMs;
+        if (now - preview.updatedAt > leaseMs || heldTooLong) {
           end(preview, now);
           events.push({ type: "preview-end", gesture: preview.gesture, reason: "expired" });
         }

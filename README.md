@@ -140,8 +140,9 @@ Escape, Try again, the system cancelling the pointer, turning Draw live
 off, or a failed submission); its hand starts another; it goes five seconds
 without a heartbeat (a closed tab, a dropped connection: unload messages
 are sent but never relied on); or it sits finished and undecided for two
-minutes. A late update for an ended gesture is refused by the server and
-ignored by every tab. A viewer leaving never ends anyone else's stroke.
+minutes. None lasts more than ten minutes whatever its heartbeat. A late
+update for an ended gesture is refused by the server and ignored by every
+tab. A viewer leaving never ends anyone else's stroke.
 
 On a laptop, against a local server, the server's own fan-out took a
 median 1.1 ms (95th percentile 2.0 ms, 60 updates), and point-to-screen

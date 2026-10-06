@@ -742,3 +742,74 @@ it("on a slow connection, coalesces a burst of movement into a few ordered updat
   expect(previews.every((p, i) => i === 0 || (p.from as number) >= (previews[i - 1].from as number))).toBe(true);
   expect($("mode-note").textContent).not.toContain("only on your screen");
 });
+
+// --- Regressions from the independent review ---------------------------------
+
+it("draws a mark that claims a gesture id this tab once used but didn't submit", async () => {
+  const { gesture, previews, flushPreviews, emitMark, strokes, $ } = buildWall({ canDraw: true });
+  gesture(10, 10, "pointerdown");
+  gesture(20, 20, "pointermove");
+  await flushPreviews();
+  const used = previews[0].gesture as string;
+  gesture(30, 30, "pointerup"); // a draft, never added
+  $("retry").click();
+  emitMark({ id: 77, path: "M5,5 L9,9", colour: "#abcdef", gesture: used });
+  expect(strokes().map((p) => p.getAttribute("data-id"))).toEqual(["77"]);
+});
+
+it("removes a duplicate when its own echo arrived untagged before the response", async () => {
+  const { stroke, emitMark, releaseFetch, settle, strokes, posted } = buildWall({
+    canDraw: true,
+    deferFetch: true,
+  });
+  stroke(1, 9);
+  await settle();
+  // The server forgot the gesture id, so the echo carries none: drawn as foreign.
+  emitMark({ id: 901, path: posted[0].path as string, colour: "#123456" });
+  expect(strokes().length).toBe(2);
+  releaseFetch();
+  await settle();
+  await settle();
+  expect(strokes().length).toBe(1);
+  expect(strokes()[0].classList.contains("mine")).toBe(true);
+});
+
+it("a reconnect refresh keeps marks that arrived after the server built its list", async () => {
+  const { emit, emitMark, svg, settle } = buildWall({
+    canDraw: true,
+    serverMarks: [{ id: 1, path: "M1,1 L2,2", colour: "#cc4a28", mine: false }],
+  });
+  emit("open");
+  emit("error");
+  emit("open"); // refresh requested
+  emitMark({ id: 2, path: "M3,3 L4,4", colour: "#cc4a28" }); // lands before the response
+  await settle();
+  await settle();
+  expect([...svg.querySelectorAll("path[data-id]")].map((p) => p.getAttribute("data-id")).sort()).toEqual([
+    "1",
+    "2",
+  ]);
+});
+
+it("ignores a second pointer going down mid-stroke", () => {
+  const { svg, window } = buildWall({ canDraw: true });
+  const down = (id: number, x: number) =>
+    svg.dispatchEvent(new window.PointerEvent("pointerdown", { clientX: x, clientY: x, pointerId: id, bubbles: true }));
+  down(1, 10);
+  svg.dispatchEvent(new window.PointerEvent("pointermove", { clientX: 20, clientY: 20, pointerId: 1, bubbles: true }));
+  down(2, 50);
+  expect(svg.querySelectorAll("path.mine").length).toBe(1);
+  expect(svg.querySelector("path.mine")!.getAttribute("d")).toBe("M10,10 L20,20");
+});
+
+it("stops sending, and says the draft is private again, once the server refuses its live preview for good", async () => {
+  const { gesture, previews, flushPreviews, $ } = buildWall({ canDraw: true, previewStatus: 403, autoPublish: false });
+  gesture(10, 10, "pointerdown");
+  gesture(20, 20, "pointermove");
+  await flushPreviews();
+  gesture(30, 30, "pointerup");
+  await flushPreviews();
+  await flushPreviews();
+  expect(previews.length).toBe(1);
+  expect($("draft-audience").textContent).toBe("Only you can see it.");
+});

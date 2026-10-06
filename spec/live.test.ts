@@ -99,6 +99,36 @@ describe("live previews", () => {
     expect(live.sweep(61_001)).toEqual([{ type: "preview-end", gesture: g, reason: "expired" }]);
   });
 
+  it("a cancel that overtakes the gesture's first update still wins", () => {
+    const live = createLive({ leaseMs: LEASE });
+    const g = randomUUID();
+    expect(live.cancel("hand-a", g, 0)).toEqual([]);
+    expect(live.update("hand-a", "#000", { gesture: g, from: 0, points: [[1, 1]] }, 1)).toMatchObject({
+      ok: false,
+      status: 410,
+    });
+  });
+
+  it("never tags a mark with a gesture id the server doesn't remember this hand using", () => {
+    const live = createLive({ leaseMs: LEASE });
+    // An unknown id (or one forgotten after a flood of others) claims nothing.
+    expect(live.commit("hand-b", randomUUID(), 0)).toBeUndefined();
+    // A hand's own cancelled preview, retried after a failed submission, still matches.
+    const g = randomUUID();
+    live.update("hand-a", "#000", { gesture: g, from: 0, points: [[1, 1]] }, 0);
+    live.cancel("hand-a", g, 1);
+    expect(live.commit("hand-a", g, 2)).toBe(g);
+  });
+
+  it("ends any preview that outlives its maximum age, heartbeats or not", () => {
+    const live = createLive({ leaseMs: LEASE, maxAgeMs: 20_000 });
+    const g = randomUUID();
+    for (let t = 0; t <= 21_000; t += 3000) {
+      live.update("hand-a", "#000", { gesture: g, from: t === 0 ? 0 : 1, points: t === 0 ? [[1, 1]] : [] }, t);
+    }
+    expect(live.sweep(21_001)).toEqual([{ type: "preview-end", gesture: g, reason: "expired" }]);
+  });
+
   it("replaces a hand's older preview when the same hand starts a new one", () => {
     const live = createLive({ leaseMs: LEASE });
     const [g1, g2] = [randomUUID(), randomUUID()];

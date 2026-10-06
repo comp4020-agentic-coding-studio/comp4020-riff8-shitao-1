@@ -44,6 +44,10 @@
   // for the finished stroke in place. It's never reused and never stored.
   let gesture = null;
   const ownGestures = new Set();
+  // The gesture this tab last submitted, with its elements: the only mark
+  // echo it treats as its own. Any other mark is drawn, even one claiming
+  // an id this tab once used.
+  let published = null;
 
   const toViewBox = (evt) => {
     const rect = svg.getBoundingClientRect();
@@ -123,6 +127,7 @@
       // added; it just won't have been watched.
       if (!res.ok && res.status !== 409 && res.status !== 429) {
         s.stopped = true;
+        if (sender === s) describeAudience();
         if (res.status !== 410 && modeNote && sender === s) {
           modeNote.textContent =
             res.status === 503
@@ -205,6 +210,16 @@
         : "Off: you're practising privately. Turn it on to let everyone here watch your line as you draw it.";
   };
 
+  const describeAudience = () => {
+    const audience = document.getElementById("draft-audience");
+    if (audience) {
+      audience.textContent =
+        sender && !sender.stopped
+          ? "Everyone watching the wall sees it dashed until you add it or try again."
+          : "Only you can see it.";
+    }
+  };
+
   const showDraft = (show) => {
     if (draftForm) draftForm.hidden = !show;
     if (publishButton) publishButton.disabled = !canPublish;
@@ -263,12 +278,7 @@
       schedule(sender);
     }
     showDraft(true);
-    const audience = document.getElementById("draft-audience");
-    if (audience) {
-      audience.textContent = sender
-        ? "Everyone watching the wall sees it dashed until you add it or try again."
-        : "Only you can see it.";
-    }
+    describeAudience();
     status.textContent = canPublish
       ? `Not on the wall yet${sender ? " (people watching see it dashed, waiting)" : ""}: add it, or try again. Escape discards it.`
       : "That one's just for practice: you can add your next mark once the day is up.";
@@ -277,6 +287,7 @@
   const publish = async () => {
     if (!draft || submitting || !canPublish) return;
     const { gesture: committing, points: pts, nonce } = draft;
+    published = { gesture: committing, live, halo };
     stopSender(false);
     submitting = true;
     publishButton.disabled = true;
@@ -307,6 +318,11 @@
       const body = await res.json().catch(() => ({}));
       const keptNote = Boolean(note?.value.trim());
       if (body.id !== undefined) {
+        // If the echo arrived without our gesture id and was drawn as a
+        // separate stroke, this is where that duplicate goes.
+        for (const el of svg.querySelectorAll(`[data-id="${body.id}"]`)) {
+          if (el !== live && el !== halo) el.remove();
+        }
         live.setAttribute("data-id", body.id);
         halo.setAttribute("data-id", body.id);
       }
@@ -330,7 +346,8 @@
   };
 
   svg.addEventListener("pointerdown", (evt) => {
-    if (submitting) return;
+    // A second finger mid-stroke is ignored rather than orphaning the first.
+    if (submitting || drawing) return;
     beginGesture(toViewBox(evt));
     svg.setPointerCapture(evt.pointerId);
   });
@@ -404,6 +421,7 @@
     // drawn in private.
     if (!liveMode) stopSender(true);
     describeMode();
+    describeAudience();
   });
   describeMode();
 
@@ -418,7 +436,20 @@
   // Previews from other hands (and other tabs of this one), by gesture id.
   // Ended ids are remembered so a late event can't bring a preview back.
   const remote = new Map();
-  const endedRemote = new Set();
+  // id -> when it ended. Forgotten after a while: by then the server has
+  // refused any late update itself, and snapshots are authoritative.
+  const endedRemote = new Map();
+  const forgetAfter = previewLease * 4 + 10_000;
+  const markEnded = (id) => {
+    const now = Date.now();
+    endedRemote.set(id, now);
+    if (endedRemote.size > 200) {
+      for (const [old, at] of endedRemote) {
+        if (now - at > forgetAfter) endedRemote.delete(old);
+        else break;
+      }
+    }
+  };
 
   const describeLive = () => {
     if (!connection) return;
@@ -430,9 +461,9 @@
         : `Live: ${n === 1 ? "someone is" : `${n} people are`} drawing right now.`;
   };
 
-  const endPreview = (id) => {
+  const endPreview = (id, remember = true) => {
     const r = remote.get(id);
-    endedRemote.add(id);
+    if (remember) markEnded(id);
     if (!r) return;
     clearTimeout(r.timer);
     r.el.remove();
@@ -461,12 +492,10 @@
   };
 
   const showMark = (mark) => {
-    if (mark.gesture && ownGestures.has(mark.gesture)) {
-      // This tab's own stroke, already drawn as `live`: just name it.
-      if (mark.gesture === gesture) {
-        live?.setAttribute("data-id", mark.id);
-        halo?.setAttribute("data-id", mark.id);
-      }
+    if (published && mark.gesture === published.gesture) {
+      // This tab's own stroke, already drawn: just name it.
+      published.live?.setAttribute("data-id", mark.id);
+      published.halo?.setAttribute("data-id", mark.id);
       return;
     }
     if (svg.querySelector(`[data-id="${mark.id}"]`)) return;
@@ -486,7 +515,7 @@
       appendStroke(mark.path, mark.colour, mark.id, mark.prompt);
     }
     rememberSeen(mark.id);
-    if (mark.gesture) endedRemote.add(mark.gesture);
+    if (mark.gesture) markEnded(mark.gesture);
   };
 
   // After a reconnect: add any marks missed while away, drop any no longer
@@ -501,9 +530,12 @@
     } catch {
       return;
     }
+    // Anything newer than the response arrived over SSE meanwhile: keep it.
     const ids = new Set(marks.map((m) => String(m.id)));
+    const newest = Math.max(0, ...marks.map((m) => m.id));
     for (const el of svg.querySelectorAll("path[data-id]")) {
-      if (!ids.has(el.getAttribute("data-id"))) el.remove();
+      const id = el.getAttribute("data-id");
+      if (Number(id) <= newest && !ids.has(id)) el.remove();
     }
     for (const m of marks) {
       if (svg.querySelector(`[data-id="${m.id}"]`)) continue;
@@ -587,7 +619,9 @@
     stream.addEventListener("previews", (evt) => {
       const snapshot = JSON.parse(evt.data);
       const current = new Set(snapshot.map((p) => p.gesture));
-      for (const id of [...remote.keys()]) if (!current.has(id)) endPreview(id);
+      // Not remembered as ended: after a server restart the drawer's tab
+      // recreates its preview under the same id, and it should reappear.
+      for (const id of [...remote.keys()]) if (!current.has(id)) endPreview(id, false);
       for (const p of snapshot) {
         const r = remote.get(p.gesture);
         if (r) r.points = [];

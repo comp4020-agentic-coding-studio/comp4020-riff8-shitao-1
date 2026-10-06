@@ -363,14 +363,14 @@ it("commits a previewed stroke under its gesture id, after persisting it, and ne
   expect(await committedPaths()).toContain(path);
 
   // The preview is over: a late update is refused, and a new viewer doesn't see it.
-  expect((await previewUpdate(hand.cookie, { gesture, from: 2, points: [[40, 40]] })).status).toBe(429);
+  expect((await previewUpdate(hand.cookie, { gesture, from: 2, points: [[40, 40]] })).status).toBe(403);
   const late = await openStream();
   expect((await late.next("previews")).some((p: { gesture: string }) => p.gesture === gesture)).toBe(false);
   late.close();
   stream.close();
 });
 
-it("refuses a preview from a visitor with no hand, or a hand that has already marked today", async () => {
+it("refuses a preview from a visitor with no hand, or (for good, not 'retry later') a hand that has already marked today", async () => {
   const anonymous = await previewUpdate("", { gesture: randomUUID(), from: 0, points: [[1, 1]] });
   expect(anonymous.status).toBe(401);
 
@@ -382,7 +382,7 @@ it("refuses a preview from a visitor with no hand, or a hand that has already ma
   });
   expect(mark.status).toBe(201);
   const after = await previewUpdate(hand.cookie, { gesture: randomUUID(), from: 0, points: [[1, 1]] });
-  expect(after.status).toBe(429);
+  expect(after.status).toBe(403);
 });
 
 it("won't let one hand update, cancel or claim another hand's preview", async () => {
@@ -619,4 +619,25 @@ it("exports a hand's own marks and notes, and keeps each mark as a standalone im
   expect(text).not.toContain(note);
   const stranger = await fetch(new URL(`/mine/marks/${id}.svg`, baseUrl), { headers: { Cookie: other.cookie } });
   expect(stranger.status).toBe(404);
+});
+
+it("a note too long to accept is refused, not taken as a blank note that deletes the old one", async () => {
+  const hand = await freshHand();
+  const { id } = await (await postMark(hand.cookie, { path: "M5,5 L6,6", note: "keep me" })).json();
+  const res = await fetch(new URL(`/mine/marks/${id}/note`, baseUrl), {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded", Cookie: hand.cookie },
+    body: new URLSearchParams({ note: "字".repeat(500) }),
+    redirect: "manual",
+  });
+  // 500 characters is legal however many bytes they urlencode to.
+  expect(res.status).toBe(303);
+  const tooLong = await fetch(new URL(`/mine/marks/${id}/note`, baseUrl), {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded", Cookie: hand.cookie },
+    body: new URLSearchParams({ note: "x".repeat(40_000) }),
+    redirect: "manual",
+  }).catch(() => undefined);
+  expect(tooLong === undefined || tooLong.status === 413 || tooLong.status === 404).toBe(true);
+  expect(await minePage(hand.cookie)).toContain("字".repeat(500));
 });

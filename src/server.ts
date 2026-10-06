@@ -219,8 +219,9 @@ const server = createServer(async (req, res) => {
       }
       // The same eligibility as a finished mark: a hand that can't add a
       // mark right now has nothing to show live either.
+      // 403, not 429: this won't change by retrying, unlike a rate limit.
       if (msUntilNextMark(hand.id) > 0) {
-        json(res, 429, { error: "Your mark is already on the wall." });
+        json(res, 403, { error: "Your mark is already on the wall." });
         return;
       }
       const result = live.update(hand.id, hand.colour, body);
@@ -345,7 +346,16 @@ const server = createServer(async (req, res) => {
       const action = url.pathname.match(/^\/mine\/marks\/(\d+)\/(note|delete)$/);
       if (req.method === "POST" && action && hand) {
         const markId = Number(action[1]);
-        const form = new URLSearchParams(await readBody(req, 4_000));
+        // 500 characters of note can urlencode to several KB.
+        let raw: string;
+        try {
+          raw = await readBody(req, 32_000);
+        } catch {
+          res.writeHead(413, { "Content-Type": "text/plain; charset=utf-8" });
+          res.end("That's too long.");
+          return;
+        }
+        const form = new URLSearchParams(raw);
         if (action[2] === "note") {
           const note = form.get("note") ?? "";
           if (note.length <= NOTE_MAX && setNote(hand.id, markId, note)) {

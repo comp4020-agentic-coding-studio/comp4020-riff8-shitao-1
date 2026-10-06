@@ -29,6 +29,7 @@ interface Preview {
   held: boolean;
   // When the stroke was finished into a draft awaiting Add to the wall.
   heldSince: number | null;
+  startedAt: number;
   updatedAt: number;
 }
 
@@ -63,19 +64,33 @@ const validPoint = (p: unknown): p is Point =>
 // A finished stroke waiting on its hand's decision is shown dashed, kept
 // alive by heartbeats --- but not forever: after heldMaxMs it's swept like
 // any abandoned preview, and the draft stays private on the hand's screen.
-export function createLive({ leaseMs, heldMaxMs = 120_000 }: { leaseMs: number; heldMaxMs?: number }) {
+// No preview outlives maxAgeMs from its first point, heartbeat or not, so
+// a client can't hold a slot of LIMITS.activeGestures open forever.
+export function createLive({
+  leaseMs,
+  heldMaxMs = 120_000,
+  maxAgeMs = 10 * 60 * 1000,
+}: {
+  leaseMs: number;
+  heldMaxMs?: number;
+  maxAgeMs?: number;
+}) {
   const active = new Map<string, Preview>();
   const ended = new Map<string, { handId: string; at: number }>();
   // Per hand, not per gesture, so minting fresh gesture ids can't dodge it:
   // the start of the current one-second window and the updates within it.
   const rate = new Map<string, { start: number; count: number }>();
 
-  const end = (preview: Preview, now: number) => {
-    active.delete(preview.gesture);
-    ended.set(preview.gesture, { handId: preview.handId, at: now });
+  const remember = (gesture: string, handId: string, at: number) => {
+    ended.set(gesture, { handId, at });
     if (ended.size > LIMITS.endedRemembered) {
       ended.delete(ended.keys().next().value!);
     }
+  };
+
+  const end = (preview: Preview, now: number) => {
+    active.delete(preview.gesture);
+    remember(preview.gesture, preview.handId, now);
   };
 
   return {
@@ -129,7 +144,7 @@ export function createLive({ leaseMs, heldMaxMs = 120_000 }: { leaseMs: number; 
         if (active.size >= LIMITS.activeGestures) {
           return { ok: false, status: 503, reason: "too many people drawing right now" };
         }
-        preview = { gesture, handId, colour, points: [], held, heldSince: null, updatedAt: now };
+        preview = { gesture, handId, colour, points: [], held, heldSince: null, startedAt: now, updatedAt: now };
         active.set(gesture, preview);
       }
 
@@ -153,9 +168,15 @@ export function createLive({ leaseMs, heldMaxMs = 120_000 }: { leaseMs: number; 
     },
 
     cancel(handId: string, gesture: unknown, now = Date.now()): LiveEvent[] {
-      if (typeof gesture !== "string") return [];
+      if (typeof gesture !== "string" || !GESTURE_RE.test(gesture)) return [];
       const preview = active.get(gesture);
-      if (!preview || preview.handId !== handId) return [];
+      if (!preview) {
+        // A cancel can overtake the gesture's first update on another
+        // connection; remembering the id makes that update arrive dead.
+        if (!ended.has(gesture)) remember(gesture, handId, now);
+        return [];
+      }
+      if (preview.handId !== handId) return [];
       end(preview, now);
       return [{ type: "preview-end", gesture, reason: "cancelled" }];
     },
@@ -172,9 +193,13 @@ export function createLive({ leaseMs, heldMaxMs = 120_000 }: { leaseMs: number; 
         end(preview, now);
         return gesture;
       }
+      // Only an id this hand is remembered to have used (a preview cancelled
+      // by a failed submission, now retried) is still its to claim; an
+      // unknown id tags nothing, so forgetting old ids never lets another
+      // hand borrow one.
       const endedEntry = ended.get(gesture);
-      if (endedEntry && endedEntry.handId !== handId) return undefined;
-      ended.set(gesture, { handId, at: now });
+      if (!endedEntry || endedEntry.handId !== handId) return undefined;
+      endedEntry.at = now;
       return gesture;
     },
 
@@ -184,7 +209,8 @@ export function createLive({ leaseMs, heldMaxMs = 120_000 }: { leaseMs: number; 
       const events: LiveEvent[] = [];
       for (const preview of active.values()) {
         const heldTooLong = preview.heldSince !== null && now - preview.heldSince > heldMaxMs;
-        if (now - preview.updatedAt > leaseMs || heldTooLong) {
+        const tooOld = now - preview.startedAt > maxAgeMs;
+        if (now - preview.updatedAt > leaseMs || heldTooLong || tooOld) {
           end(preview, now);
           events.push({ type: "preview-end", gesture: preview.gesture, reason: "expired" });
         }

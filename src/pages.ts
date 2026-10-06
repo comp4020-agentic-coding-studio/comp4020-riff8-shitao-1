@@ -29,6 +29,7 @@ export function wallPage(
   marks: Mark[],
   hand: { id: string; colour: string },
   msUntilNextMark: number,
+  previewLeaseMs: number,
 ): string {
   const alreadyMarked = msUntilNextMark > 0;
   // Ten colours across every hand means colour alone can't tell a returning
@@ -40,10 +41,10 @@ export function wallPage(
   const strokes = [
     ...marks
       .filter((m) => m.hand_id !== hand.id)
-      .map((m) => `<path d="${escape(m.path)}" stroke="${escape(m.colour)}" />`),
+      .map((m) => `<path d="${escape(m.path)}" stroke="${escape(m.colour)}" data-id="${m.id}" />`),
     ...own.flatMap((m) => [
-      `<path d="${escape(m.path)}" class="halo" />`,
-      `<path d="${escape(m.path)}" stroke="${escape(m.colour)}" class="mine" />`,
+      `<path d="${escape(m.path)}" class="halo" data-id="${m.id}" />`,
+      `<path d="${escape(m.path)}" stroke="${escape(m.colour)}" class="mine" data-id="${m.id}" />`,
     ]),
   ].join("\n      ");
   const ownCount = own.length;
@@ -66,12 +67,14 @@ export function wallPage(
       ${strokes}
       </svg>
       ${prompt}
+      <p id="connection" aria-live="polite">Connecting to the wall…</p>
       <p><small>You draw as <strong style="color:${escape(handColour)}">this colour</strong>.${ownCount > 0 ? ` Your ${ownCount === 1 ? "mark is" : `${ownCount} marks are`} the thicker ${ownCount === 1 ? "stroke" : "strokes"}.` : ""} <a href="/readme/">What this is, and why</a>.</small></p>
     </main>
     <script
       src="/wall.js"
       data-can-draw="${alreadyMarked ? "false" : "true"}"
       data-hand-colour="${escape(handColour)}"
+      data-preview-lease="${previewLeaseMs}"
     ></script>`,
   );
 }

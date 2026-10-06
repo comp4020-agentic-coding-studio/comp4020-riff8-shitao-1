@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { readFileSync } from "node:fs";
 import { extname, join } from "node:path";
 import { addMark, allMarks, createHand, getHand, msUntilNextMark } from "./db.ts";
+import { createLive, type LiveEvent } from "./live.ts";
 import { colourFor, nameFor, newHandId, parseHandCookie, setHandCookie } from "./identity.ts";
 import { readmePage, untilPhrase, wallPage } from "./pages.ts";
 
@@ -11,18 +12,23 @@ const PORT = Number(process.env.PORT ?? 8080);
 // connection is actually https" without trusting a header the app can't verify.
 const isProd = Boolean(process.env.FLY_APP_NAME);
 
+// How long a preview survives without an update before it's swept away: the
+// drawing tab heartbeats well inside this, so only an abandoned gesture (a
+// closed tab, a dropped connection) ever reaches it.
+const PREVIEW_LEASE_MS = Number(process.env.PREVIEW_LEASE_MS ?? 5000);
+
 const STATIC_TYPES: Record<string, string> = {
   ".css": "text/css; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
 };
 
-function readBody(req: IncomingMessage): Promise<string> {
+function readBody(req: IncomingMessage, limit = 100_000): Promise<string> {
   return new Promise((resolve, reject) => {
     let data = "";
     let size = 0;
     req.on("data", (chunk: Buffer) => {
       size += chunk.length;
-      if (size > 100_000) {
+      if (size > limit) {
         reject(new Error("body too large"));
         req.destroy();
         return;
@@ -44,6 +50,14 @@ interface HandInfo {
   colour: string;
 }
 
+// Preview routes never mint a hand: only a visitor who already loaded the
+// wall (and so holds a cookie the server issued) can draw live.
+function existingHand(req: IncomingMessage): HandInfo | undefined {
+  const id = parseHandCookie(req.headers.cookie);
+  const found = id ? getHand(id) : undefined;
+  return found ? { id: found.id, colour: found.colour } : undefined;
+}
+
 function ensureHand(req: IncomingMessage, res: ServerResponse): HandInfo {
   const existing = parseHandCookie(req.headers.cookie);
   const found = existing ? getHand(existing) : undefined;
@@ -55,25 +69,43 @@ function ensureHand(req: IncomingMessage, res: ServerResponse): HandInfo {
   return { id: hand.id, colour: hand.colour };
 }
 
-// The real-time layer: every open tab holds one of these open, and a mark
-// lands in all of them (this one included --- wall.js tells its own gesture
-// apart from the echo by the nonce it posted, not by asking the server to
-// skip it) the moment `addMark` commits. A plain in-memory Set is enough
-// because fly.toml runs exactly one machine --- there's no cross-machine
-// fan-out to build.
+// The real-time layer: every open tab holds one of these open. Two kinds of
+// event share it. `mark` is a committed stroke, written only after `addMark`
+// returns; `preview`/`preview-end` (and the `previews` snapshot a fresh
+// connection starts with) are the ephemeral strokes still being drawn, which
+// src/live.ts keeps in memory and never persists. A plain in-memory Set is
+// enough because fly.toml runs exactly one machine --- there's no
+// cross-machine fan-out to build.
 interface SseClient {
   res: ServerResponse;
   heartbeat: ReturnType<typeof setInterval>;
 }
 
 const sseClients = new Set<SseClient>();
+const live = createLive({ leaseMs: PREVIEW_LEASE_MS });
 
-function broadcastMark(mark: { path: string; colour: string; nonce?: string }): void {
-  const payload = JSON.stringify({ path: mark.path, colour: mark.colour, nonce: mark.nonce });
-  for (const client of sseClients) {
-    client.res.write(`event: mark\ndata: ${payload}\n\n`);
-  }
+function send(event: string, data: unknown): void {
+  const frame = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const client of sseClients) client.res.write(frame);
 }
+
+function broadcastLive(events: LiveEvent[]): void {
+  for (const { type, ...data } of events) send(type, data);
+}
+
+// The gesture id lets viewers swap a preview for its committed stroke in
+// place. Nothing a tab sends to prove who it is (the cookie, a submission
+// nonce) ever goes out over this stream.
+function broadcastMark(mark: { id: number; path: string; colour: string; gesture?: string }): void {
+  send("mark", { id: mark.id, path: mark.path, colour: mark.colour, gesture: mark.gesture });
+}
+
+setInterval(() => broadcastLive(live.sweep()), 1000).unref();
+
+const json = (res: ServerResponse, status: number, body: unknown) => {
+  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify(body));
+};
 
 const server = createServer(async (req, res) => {
   try {
@@ -82,7 +114,7 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/") {
       const hand = ensureHand(req, res);
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(wallPage(allMarks(), hand, msUntilNextMark(hand.id)));
+      res.end(wallPage(allMarks(), hand, msUntilNextMark(hand.id), PREVIEW_LEASE_MS));
       return;
     }
 
@@ -105,10 +137,63 @@ const server = createServer(async (req, res) => {
       const heartbeat = setInterval(() => res.write(": ping\n\n"), 20_000);
       const client: SseClient = { res, heartbeat };
       sseClients.add(client);
+      // Every connection (first or reconnect) starts from the strokes being
+      // drawn right now, so a viewer never waits for the next point to see
+      // one, and a reconnecting viewer drops any it missed the end of.
+      res.write(`event: previews\ndata: ${JSON.stringify(live.snapshot())}\n\n`);
       req.on("close", () => {
         clearInterval(heartbeat);
         sseClients.delete(client);
       });
+      return;
+    }
+
+    // Committed marks as data, for a tab that reconnects and needs to catch
+    // up on what it missed. `mine` is computed per request and the hand id
+    // itself never leaves the server.
+    if (req.method === "GET" && url.pathname === "/api/marks") {
+      const handId = parseHandCookie(req.headers.cookie);
+      json(
+        res,
+        200,
+        allMarks().map((m) => ({ id: m.id, path: m.path, colour: m.colour, mine: m.hand_id === handId })),
+      );
+      return;
+    }
+
+    if (req.method === "POST" && (url.pathname === "/api/strokes/live" || url.pathname === "/api/strokes/live/cancel")) {
+      const hand = existingHand(req);
+      if (!hand) {
+        json(res, 401, { error: "Load the wall first." });
+        return;
+      }
+      let body: Record<string, unknown>;
+      try {
+        body = JSON.parse(await readBody(req, 8_000)) as Record<string, unknown>;
+        if (typeof body !== "object" || body === null) throw new Error("not an object");
+      } catch {
+        json(res, 400, { error: "Malformed request." });
+        return;
+      }
+      if (url.pathname.endsWith("/cancel")) {
+        broadcastLive(live.cancel(hand.id, body.gesture));
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      // The same eligibility as a finished mark: a hand that can't add a
+      // mark right now has nothing to show live either.
+      if (msUntilNextMark(hand.id) > 0) {
+        json(res, 429, { error: "Your mark is already on the wall." });
+        return;
+      }
+      const result = live.update(hand.id, hand.colour, body);
+      if (!result.ok) {
+        json(res, result.status, { error: result.reason, count: result.count });
+        return;
+      }
+      broadcastLive(result.events);
+      json(res, 200, { count: result.count });
       return;
     }
 
@@ -125,11 +210,11 @@ const server = createServer(async (req, res) => {
 
       const raw = await readBody(req);
       let path: unknown;
-      let nonce: unknown;
+      let gesture: unknown;
       try {
-        const body = JSON.parse(raw) as { path?: unknown; nonce?: unknown };
+        const body = JSON.parse(raw) as { path?: unknown; gesture?: unknown };
         path = body.path;
-        nonce = body.nonce;
+        gesture = body.gesture;
       } catch {
         res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
         res.end("Malformed request.");
@@ -137,18 +222,11 @@ const server = createServer(async (req, res) => {
       }
 
       if (typeof path !== "string" || !PATH_RE.test(path)) {
+        broadcastLive(live.cancel(hand.id, gesture));
         res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
         res.end("That doesn't look like a mark.");
         return;
       }
-      // An opaque, client-chosen token so a tab can recognise its own mark
-      // coming back over SSE --- never stored, never rendered, just echoed.
-      // Comparing path *content* instead (the previous approach) breaks the
-      // moment two hands draw the same short stroke, which rounded,
-      // low-point-count coordinates make a real possibility, not a
-      // hypothetical one.
-      const markNonce = typeof nonce === "string" && nonce.length <= 200 ? nonce : undefined;
-
       // The check has to be the last thing before the insert, with no
       // `await` between them: a client that holds its request body open
       // (a slow POST, or just a second tab) can otherwise pass this check
@@ -157,13 +235,14 @@ const server = createServer(async (req, res) => {
       // separates the two, nothing can interleave here.
       const wait = msUntilNextMark(hand.id);
       if (wait > 0) {
+        broadcastLive(live.cancel(hand.id, gesture));
         res.writeHead(429, { "Content-Type": "text/plain; charset=utf-8" });
         res.end(`Your mark is already on the wall. You can add another ${untilPhrase(wait)}.`);
         return;
       }
 
       const mark = addMark(hand.id, path, hand.colour);
-      broadcastMark({ ...mark, nonce: markNonce });
+      broadcastMark({ ...mark, gesture: live.commit(hand.id, gesture) });
       res.writeHead(201, { "Content-Type": "text/plain; charset=utf-8" });
       res.end("ok");
       return;

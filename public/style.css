@@ -35,6 +35,16 @@ body {
   stroke-linejoin: round;
 }
 
+/* Someone else's stroke while it's still being drawn: lighter until it's
+   committed, then the same element simply loses this class. */
+#wall path.preview {
+  opacity: 0.55;
+}
+
+#wall path.preview.held {
+  stroke-dasharray: 10 8;
+}
+
 #wall path.mine {
   stroke-width: 7;
 }
@@ -42,6 +52,10 @@ body {
 #wall path.halo {
   stroke: Canvas;
   stroke-width: 13;
+}
+
+#connection {
+  font-size: 0.875em;
 }
 
 main img {

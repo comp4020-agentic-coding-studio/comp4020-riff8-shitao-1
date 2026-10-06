@@ -1,6 +1,7 @@
 import { JSDOM } from "jsdom";
 import { expect, inject, it } from "vitest";
 import net from "node:net";
+import { randomUUID } from "node:crypto";
 
 // Trace's own promises, from README.md's "what's enforced" list: a
 // first-time visitor gets a hand, a mark they draw shows up and survives a
@@ -220,4 +221,254 @@ it("ships no third-party script or stylesheet", async () => {
       false,
     );
   }
+});
+
+// --- Live previews -----------------------------------------------------------
+
+// Reads one SSE connection, handing back events of a given type as they
+// arrive (and remembering everything seen, so a test can check what never
+// came).
+async function openStream() {
+  const controller = new AbortController();
+  const res = await fetch(new URL("/api/marks/stream", baseUrl), { signal: controller.signal });
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  const seen: { event: string; data: any }[] = [];
+  const pending: { match: (e: { event: string; data: any }) => boolean; resolve: (d: any) => void }[] = [];
+  const offer = (e: { event: string; data: any }) => {
+    seen.push(e);
+    const i = pending.findIndex((p) => p.match(e));
+    if (i !== -1) pending.splice(i, 1)[0].resolve(e.data);
+  };
+  (async () => {
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) return;
+        buffered += decoder.decode(value, { stream: true });
+        let boundary;
+        while ((boundary = buffered.indexOf("\n\n")) !== -1) {
+          const chunk = buffered.slice(0, boundary);
+          buffered = buffered.slice(boundary + 2);
+          const event = chunk.match(/^event: (.*)$/m)?.[1];
+          const data = chunk.match(/^data: (.*)$/m)?.[1];
+          if (event && data) offer({ event, data: JSON.parse(data) });
+        }
+      }
+    } catch {
+      // aborted
+    }
+  })();
+  const next = (event: string, where: (d: any) => boolean = () => true, ms = 3000): Promise<any> => {
+    const already = seen.find((e) => e.event === event && where(e.data));
+    if (already) return Promise.resolve(already.data);
+    return new Promise((resolve, reject) => {
+      const entry = { match: (e: { event: string; data: any }) => e.event === event && where(e.data), resolve };
+      pending.push(entry);
+      setTimeout(() => reject(new Error(`no ${event} event within ${ms}ms`)), ms);
+    });
+  };
+  return { next, seen, close: () => controller.abort() };
+}
+
+const freshHand = async () => {
+  const res = await fetch(new URL("/", baseUrl));
+  const html = await res.text();
+  const colour = html.match(/data-hand-colour="([^"]+)"/)![1];
+  return { cookie: cookieFrom(res), colour };
+};
+
+const previewUpdate = (cookie: string, body: object) =>
+  fetch(new URL("/api/strokes/live", baseUrl), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify(body),
+  });
+
+const previewCancel = (cookie: string, gesture: string) =>
+  fetch(new URL("/api/strokes/live/cancel", baseUrl), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({ gesture }),
+  });
+
+const committedPaths = async () =>
+  ((await (await fetch(new URL("/api/marks", baseUrl))).json()) as { path: string }[]).map(
+    (m) => m.path,
+  );
+
+it("broadcasts a stroke point by point while it's drawn, in the hand's own colour, with nothing persisted", async () => {
+  const stream = await openStream();
+  const hand = await freshHand();
+  const gesture = randomUUID();
+  const x = 100 + (Date.now() % 500);
+
+  // The colour a client claims is ignored: the server derives it from the hand.
+  let res = await previewUpdate(hand.cookie, { gesture, from: 0, points: [[x, 1], [x, 2]], colour: "#000000" });
+  expect(res.status).toBe(200);
+  const first = await stream.next("preview", (d) => d.gesture === gesture);
+  expect(first).toEqual({ gesture, colour: hand.colour, from: 0, points: [[x, 1], [x, 2]], held: false });
+
+  res = await previewUpdate(hand.cookie, { gesture, from: 2, points: [[x, 3]] });
+  expect(await res.json()).toEqual({ count: 3 });
+  const second = await stream.next("preview", (d) => d.gesture === gesture && d.from === 2);
+  expect(second.points).toEqual([[x, 3]]);
+
+  // Nothing identifying goes out with it.
+  const raw = JSON.stringify(stream.seen);
+  expect(raw).not.toContain(hand.cookie.split("=")[1]);
+
+  // Not a mark: absent from the committed wall, and the hand can still draw today.
+  expect(await committedPaths()).not.toContain(`M${x},1 L${x},2 L${x},3`);
+  expect(await committedPaths()).not.toContain(`M${x},1 L${x},2`);
+  const page = await (await fetch(new URL("/", baseUrl), { headers: { Cookie: hand.cookie } })).text();
+  expect(page).toContain('data-can-draw="true"');
+
+  await previewCancel(hand.cookie, gesture);
+  stream.close();
+});
+
+it("tells a new connection which strokes are being drawn right now", async () => {
+  const hand = await freshHand();
+  const gesture = randomUUID();
+  await previewUpdate(hand.cookie, { gesture, from: 0, points: [[5, 5], [6, 6]] });
+  const stream = await openStream();
+  const snapshot = await stream.next("previews");
+  expect(snapshot).toContainEqual({ gesture, colour: hand.colour, points: [[5, 5], [6, 6]], held: false });
+  await previewCancel(hand.cookie, gesture);
+  stream.close();
+});
+
+it("commits a previewed stroke under its gesture id, after persisting it, and never broadcasts the nonce", async () => {
+  const stream = await openStream();
+  const hand = await freshHand();
+  const gesture = randomUUID();
+  const nonce = randomUUID();
+  const path = `M${Date.now() % 100_000},30 L31,32 L33,34`;
+  await previewUpdate(hand.cookie, { gesture, from: 0, points: [[1, 30], [31, 32]] });
+  await stream.next("preview", (d) => d.gesture === gesture);
+
+  const post = await fetch(new URL("/api/marks", baseUrl), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: hand.cookie },
+    body: JSON.stringify({ path, nonce, gesture }),
+  });
+  expect(post.status).toBe(201);
+  const mark = await stream.next("mark", (d) => d.gesture === gesture);
+  expect(mark.path).toBe(path);
+  expect(typeof mark.id).toBe("number");
+  expect(JSON.stringify(stream.seen)).not.toContain(nonce);
+  // Broadcast only once persisted: the committed wall already has it.
+  expect(await committedPaths()).toContain(path);
+
+  // The preview is over: a late update is refused, and a new viewer doesn't see it.
+  expect((await previewUpdate(hand.cookie, { gesture, from: 2, points: [[40, 40]] })).status).toBe(429);
+  const late = await openStream();
+  expect((await late.next("previews")).some((p: { gesture: string }) => p.gesture === gesture)).toBe(false);
+  late.close();
+  stream.close();
+});
+
+it("refuses a preview from a visitor with no hand, or a hand that has already marked today", async () => {
+  const anonymous = await previewUpdate("", { gesture: randomUUID(), from: 0, points: [[1, 1]] });
+  expect(anonymous.status).toBe(401);
+
+  const hand = await freshHand();
+  const mark = await fetch(new URL("/api/marks", baseUrl), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: hand.cookie },
+    body: JSON.stringify({ path: "M7,7 L8,8" }),
+  });
+  expect(mark.status).toBe(201);
+  const after = await previewUpdate(hand.cookie, { gesture: randomUUID(), from: 0, points: [[1, 1]] });
+  expect(after.status).toBe(429);
+});
+
+it("won't let one hand update, cancel or claim another hand's preview", async () => {
+  const stream = await openStream();
+  const owner = await freshHand();
+  const intruder = await freshHand();
+  const gesture = randomUUID();
+  await previewUpdate(owner.cookie, { gesture, from: 0, points: [[1, 1]] });
+
+  expect((await previewUpdate(intruder.cookie, { gesture, from: 1, points: [[9, 9]] })).status).toBe(403);
+  await previewCancel(intruder.cookie, gesture);
+  // A mark that tries to borrow the id lands, but untagged: viewers won't
+  // mistake it for the owner's stroke.
+  const path = `M${Date.now() % 100_000},50 L51,52`;
+  await fetch(new URL("/api/marks", baseUrl), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: intruder.cookie },
+    body: JSON.stringify({ path, gesture }),
+  });
+  const intruderMark = await stream.next("mark", (d) => d.path === path);
+  expect(intruderMark.gesture).toBeUndefined();
+
+  const check = await openStream();
+  const snapshot = await check.next("previews");
+  expect(snapshot.find((p: { gesture: string }) => p.gesture === gesture)?.points).toEqual([[1, 1]]);
+  expect(stream.seen.some((e) => e.event === "preview-end" && e.data.gesture === gesture)).toBe(false);
+
+  await previewCancel(owner.cookie, gesture);
+  check.close();
+  stream.close();
+});
+
+it("clears a cancelled preview for every viewer, and won't let it be resurrected", async () => {
+  const stream = await openStream();
+  const hand = await freshHand();
+  const gesture = randomUUID();
+  await previewUpdate(hand.cookie, { gesture, from: 0, points: [[1, 1]] });
+  expect((await previewCancel(hand.cookie, gesture)).status).toBe(204);
+  expect(await stream.next("preview-end", (d) => d.gesture === gesture)).toEqual({
+    gesture,
+    reason: "cancelled",
+  });
+  expect((await previewUpdate(hand.cookie, { gesture, from: 1, points: [[2, 2]] })).status).toBe(410);
+  stream.close();
+});
+
+it("sweeps away an abandoned preview once its lease runs out, without it ever becoming a mark", async () => {
+  const stream = await openStream();
+  const hand = await freshHand();
+  const gesture = randomUUID();
+  const x = 200 + (Date.now() % 500);
+  await previewUpdate(hand.cookie, { gesture, from: 0, points: [[x, 9], [x, 10]] });
+  // No cancel, no more updates: a tab that closed without saying goodbye.
+  const ended = await stream.next("preview-end", (d) => d.gesture === gesture, 9000);
+  expect(ended.reason).toBe("expired");
+  expect(await committedPaths()).not.toContain(`M${x},9 L${x},10`);
+  stream.close();
+}, 15_000);
+
+it("a viewer disconnecting doesn't end anyone else's preview", async () => {
+  const hand = await freshHand();
+  const gesture = randomUUID();
+  const viewer = await openStream();
+  await previewUpdate(hand.cookie, { gesture, from: 0, points: [[1, 1]] });
+  await viewer.next("preview", (d) => d.gesture === gesture);
+  viewer.close();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const other = await openStream();
+  expect((await other.next("previews")).some((p: { gesture: string }) => p.gesture === gesture)).toBe(true);
+  await previewCancel(hand.cookie, gesture);
+  other.close();
+});
+
+it("bounds preview payloads and rejects bad coordinates", async () => {
+  const hand = await freshHand();
+  const bad = [
+    { gesture: "not-a-uuid", from: 0, points: [[1, 1]] },
+    { gesture: randomUUID(), from: 0, points: [[1.5, 1]] },
+    { gesture: randomUUID(), from: 0, points: [[1, 1e9]] },
+    { gesture: randomUUID(), from: 0, points: Array.from({ length: 201 }, () => [1, 1]) },
+  ];
+  for (const body of bad) {
+    expect((await previewUpdate(hand.cookie, body)).status).toBe(400);
+  }
+  // Over the 8 KB body cap: refused outright, never parsed.
+  const huge = { gesture: randomUUID(), from: 0, points: [[1, 1]], pad: "x".repeat(20_000) };
+  const res = await previewUpdate(hand.cookie, huge).catch(() => undefined);
+  expect(res === undefined || res.status === 400).toBe(true);
 });

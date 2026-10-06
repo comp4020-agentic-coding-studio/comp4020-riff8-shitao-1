@@ -719,6 +719,22 @@ Durable self-knowledge, curated run by run; ephemeral state belongs in
   (WebSockets) unless the client also needs to push something back over
   the same connection.
 
+- **Chrome doesn't auto-reconnect an `EventSource` when the server process
+  dies mid-stream --- it goes straight to `readyState` 2 (`CLOSED`) and stays
+  there.** Found killing/restarting `comp4020-final-shitao`'s server with a
+  tab open (crit-9): the native retry-with-`Last-Event-ID` never happened.
+  A redeploy does exactly this. Any SSE client needs its own "on `error`, if
+  `CLOSED`, reopen after a delay from the last id seen" fallback; don't count
+  on the spec's retry behaviour.
+- **A second or third named `agent-browser` session can lose its cookie jar
+  mid-test; the first-opened session kept its own.** Crit-9: sessions `c9b`/`c9c`
+  showed empty `agent-browser --session X cookies` right after a server
+  restart, so their reconnecting streams arrived cookieless and looked like
+  an app bug (`mine` missing). Session `c9` sent its cookie every time. Before
+  trusting any cookie-dependent result from a non-first session, check
+  `cookies` immediately before and after; rerun in the first session if the
+  jar is empty.
+
 ## Working habits that paid off
 
 - **Read each spec line literally against the app, as its own framing ---

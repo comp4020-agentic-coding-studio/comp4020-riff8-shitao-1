@@ -1,24 +1,32 @@
 # now
 
-**`comp4020-final-shitao`, crit-8 ("It's alive!") --- finished.** Final run
-at 28h to cutoff.
+**`comp4020-final-shitao`, crit-9 ("All at once") --- built, committed
+locally, not pushed.** Run at 141h to cutoff.
 
 ## What this run did
 
-- `051ab1d` PROCESS.md now cites `a9d92f3` (busy-wall halo) and `51bbd82`
-  (first-mark cue) inside the "reread the spec literally" paragraph; trimmed
-  elsewhere (~670 by `wc`, links included)
-- `aa7e4ea` `reflections/crit-8.md`, headed "It's alive!" (raw JSON `title`),
-  290 words; breakthrough = reading the spec line literally instead of
-  trusting the test named after it
+The crit's one decision: what a tab sees after its stream drops (phone lock,
+or the redeploy every push to `main` now triggers). Chose replay from the
+last mark id, recorded in `decisions/0001-coming-back-after-a-gap.md`
+(options, costs, checks) and linked from the README's new "Coming back after
+a gap" section.
 
-43/43 green, `check:evidence` green, local browser pass clean, pushed
-(`main` == `origin/main`), deployed; live `/` and `/readme/` 200, console
-clean, live `wall.js` serves the latest code.
+- `7894d00` server: SSE `id:` = mark row id; replays `marksSince` from
+  `Last-Event-ID` or `?since=`; `mine` flag on a hand's own streams (cookie
+  on the stream request); POST returns `{id}`
+- `a1d5567` wall.js: opens with `?since=<data-since>`, dedupes by id,
+  reopens a stream Chrome left `CLOSED`, paints another tab's own mark as
+  `mine` and disables drawing (closes crit-8's known second-tab gap)
+- `9645567` ADR + README; `cffb448` PROCESS "Several people at once"
+
+51/51 green, `check:evidence` green, each new client test confirmed to fail
+against the old `wall.js`. Real-browser kill/restart/post test: the missed
+mark appeared, no reload.
 
 ## Next action
 
-Crit-9 ("All at once") runs in this same repo, now public: every push to
-`main` deploys via CI and is public immediately. Known minor gap to carry:
-a second open tab of the *same* hand draws its own SSE echo as a thin,
-non-`mine` stroke until reload (the payload deliberately carries no hand).
+Finishing run: write `reflections/crit-9.md` (title "All at once", raw JSON
+`title`), trim PROCESS.md (~830 words by `wc` now), push (CI deploys), then
+verify live: open two tabs on `.fly.dev`, draw in one, see it in the other.
+A mid-week run could also handle SIGTERM by ending SSE responses cleanly so
+browsers retry natively, but the client fallback already covers it.

@@ -1,80 +1,83 @@
-# Brief: show a stroke while it's being drawn, not only once it's finished
+# Trace: live shared drawing with a reason to return
 
-Right now a hand's gesture is invisible to every other open tab until it
-posts: `appendStroke` only runs when an `event: mark` arrives over
-`/api/marks/stream`, and `broadcastMark` only fires after `addMark` persists
-a finished path (`src/server.ts`). The README's own "What's real-time, and
-why" section names this as the current, known shape: "only marks made while
-they're actually looking stream in... the wall reads as a wall, not an
-activity feed" — and separately flags that showing an *in-progress* gesture
-to other hands hasn't been tried yet.
+## Your task and working context
 
-Make the wall show a stroke live, point by point, while the hand drawing it
-is still mid-gesture — so two open tabs watching the same wall see the line
-grow in something close to real time, the same way the drawing hand already
-sees their own `live`/`halo` path grow locally in `public/wall.js`.
+You are the crit agent continuing Trace in the pod-riff repository. Combine two goals: show another person's stroke while it is being drawn, and make the app more meaningful than a place to leave one mark every 24 hours. Implement the live-stroke foundation first, then a coherent product improvement that gives visitors a reason to contribute, something useful in return, and a reason to revisit. Be imaginative: the sketchbook ideas below are optional candidates, not a ceiling or a fixed feature checklist.
 
-## What "good" looks like here
+Inspect the actual repository, its instructions, current changes, dependencies, history, tests, CI, and deployment configuration before choosing an approach. Work only in the pod-riff copy; the original final-project repository is off limits. Preserve existing visitor drawings and unrelated work. Follow the pod-riff block of `CLAUDE.md`, including keeping `main` deployable and removing this prompt in the agent's final commit. Leave that governing block unchanged. This riff does not require a graded reflection or a new `PROCESS.md` entry.
 
-- This is a second, ephemeral layer on top of the existing one, not a
-  replacement for it. The existing invariant stays true word for word: **"A
-  mark broadcasts over `/api/marks/stream` the moment it's persisted, never
-  before."** A live, in-progress stroke is not a mark — it hasn't been typed
-  into the one-per-day limit, hasn't been persisted, and must never be
-  treated as if it had been. If a tab reloads mid-gesture, or the gesture
-  never finishes, there is nothing left behind: the live preview is pure
-  broadcast, with no row in `trace.db`.
-- When the gesture finishes and its real mark lands (persisted, broadcast,
-  same as today), the other tabs' in-progress preview for that gesture has
-  to resolve into the same finished stroke the existing `mark` event
-  already draws — no visible jump, no leftover duplicate line sitting under
-  or over it.
-- When a gesture is abandoned instead of finished — pointer cancelled, lifted
-  after fewer than two points, `Escape`, the tab closing, the SSE connection
-  dropping mid-draw — every other tab's preview of that gesture has to
-  disappear too. A half-drawn line that never resolves and never clears is
-  worse than the current all-or-nothing reveal.
-- Keep "one hand, one mark" exactly as strict as it is today: only a hand
-  that `canDraw` ever starts a gesture (unchanged), and the one-mark-a-day
-  check in `src/db.ts`/`msUntilNextMark` still gates the *finished* mark
-  exactly as it does now. Streaming the in-progress points changes nothing
-  about who's allowed to end up with a stroke on the wall.
-- Don't let this become a second identity channel. A live stroke renders in
-  the drawing hand's colour, same as it does locally already and same as a
-  finished mark would — nothing about this should let one tab infer *which*
-  other hand (cookie) is drawing, beyond what colour already discloses today.
-- No accounts, no text, no third-party requests, no new persisted state,
-  `DB_PATH` untouched — every rule in `CLAUDE.md`'s "Your harness" section
-  still applies to whatever you build.
-- Keep the mechanism as plain as the rest of this app. SSE was chosen over
-  WebSockets because the wall only ever pushed one thing, one direction;
-  that reasoning still holds for *delivering* live points to other tabs
-  (keep using `/api/marks/stream`, with a new event type alongside `mark`,
-  rather than reaching for WebSockets). The one new wrinkle is that a
-  drawing tab now needs to *send* its in-progress points somewhere — pick
-  the smallest mechanism that does that (an endpoint the existing
-  `sseClients` broadcast loop can feed from is probably enough; you don't
-  need to persist or rate-limit-per-day anything that isn't a finished
-  mark). Do throttle how often a single gesture broadcasts (e.g. on
-  `pointermove`/arrow-key steps, not unconditionally on every point) so one
-  busy hand can't flood every open tab.
-- A gesture needs some way for other tabs to tell "this update continues
-  that stroke" from "this is a new one," and a way to know a gesture ended
-  without a finished mark. A per-gesture id generated client-side the
-  moment a gesture begins (sibling to the existing per-POST `nonce`, not a
-  replacement for it) is the obvious shape; use whatever's simplest as long
-  as two hands drawing at once never merge into one preview.
+The live [Trace homepage](https://comp4020-final-shitao.fly.dev/) and [README](https://comp4020-final-shitao.fly.dev/readme/) were reviewed on 6 October 2026. The interface presents an anonymous shared wall, browser colour identity, pointer/keyboard drawing, and a daily contribution rule. Published claims about persistence, highlighting, and finished-mark synchronization were not independently tested during that review. The supplied technical brief describes the paths and functions below; verify them against the current checkout rather than assuming its snapshot still matches.
 
-## Testing
+## Phase one: show a stroke before it becomes a finished mark
 
-`spec/wall-client.test.ts` already loads the real `public/wall.js` into
-jsdom and drives it with real pointer/keyboard events, stubbing only what
-jsdom lacks — extend it (or add alongside it) rather than asserting behaviour
-in prose: at minimum, two simulated hands where one's in-progress gesture is
-visible to the other before it posts, and a cancelled gesture that leaves
-nothing behind. `spec/wall.test.ts` covers the server/SSE side; add coverage
-there for "an in-progress stroke never reaches `allMarks()`/the database."
-Keep `spec/invariants.test.ts` green. Update README's "What's real-time, and
-why" section to describe what you actually built and tested, the same way
-every other section there reports what was driven and confirmed, not just
-what was intended.
+The supplied brief describes a gesture remaining invisible to other tabs until submission: `appendStroke` runs after an `event: mark` arrives over `/api/marks/stream`, and `broadcastMark` in `src/server.ts` runs after `addMark` persists the finished path. Change this so another open session can watch the line grow point by point while the drawing hand is still mid-gesture, much as that hand's local `live` and `halo` paths already grow in `public/wall.js`.
+
+Preserve this invariant exactly: **A mark broadcasts over `/api/marks/stream` the moment it's persisted, never before.** A live preview is a separate ephemeral layer, not a committed mark. Sending preview points must not write a row to `trace.db`, consume the daily allowance, or make an abandoned gesture part of saved history. A reload or unfinished gesture leaves no new persistent artwork. Existing completed drawings remain intact.
+
+Keep phase one within the existing harness: no accounts, typed captions, uploaded images, third-party runtime requests, new persistent preview state, changes to `DB_PATH`, or relaxation of the rolling 24-hour allowance. `canDraw` still controls the drawing interface, and `src/db.ts`/`msUntilNextMark` still enforce eligibility for the finished mark on the server. Preview creation also needs server-side eligibility and ownership checks; hiding a control is not sufficient. Preview traffic does not itself count as a daily contribution.
+
+## Preview transport, lifecycle, and privacy
+
+Continue using `/api/marks/stream` for delivery, adding distinct ephemeral preview events alongside the existing committed `mark` event. Let the drawing browser send preview updates through the smallest suitable same-origin mechanism, such as a bounded HTTP endpoint feeding the existing `sseClients` broadcast loop. Avoid a transport rewrite unless the current code reveals a concrete requirement that SSE cannot satisfy. Polling may support recovery or another shared view, but cannot replace the required experience of watching an active stroke grow.
+
+Give each gesture a fresh, non-identifying ID separate from the existing per-submission nonce. Preserve that nonce and its existing retry behaviour. Other tabs must distinguish successive updates to one gesture, a new gesture, cancellation, and the matching committed mark. Bind ownership and colour to the authenticated anonymous hand on the server; clients must not impersonate another colour or update/cancel another hand's preview. Never broadcast cookies, stable hand identifiers, or submission nonces. A temporary gesture ID must not become a persistent profile or identity channel.
+
+When the finished mark is successfully persisted, reconcile its preview into the existing saved-stroke rendering without a duplicate line, visible geometry jump, or stale overlay. Handle either the HTTP response or the final SSE event arriving first. Deduplicate retries and reconnect deliveries, and reject delayed preview updates after a gesture has completed or been cancelled. Two people drawing simultaneously must have separate previews, and an incoming event must not overwrite another visitor's active local gesture.
+
+Cancellation must clear the remote preview when the pointer is cancelled, fewer than two points are drawn, Escape is pressed, submission fails, or the originating tab closes or loses its drawing connection. Do not rely on unload delivery alone: implement bounded expiry or a lease/heartbeat so abandoned previews disappear even when cancellation cannot be delivered. A viewing tab disconnecting must not cancel another person's active drawing. Reconnection should refresh committed state and recover or discard temporary previews consistently without destroying local work.
+
+Throttle and coalesce updates rather than sending an unbounded request for every pointer movement. Bound payload sizes, point counts, update rates, active gestures, and temporary memory. Validate coordinates and ordering. Keep responsiveness acceptable on a slow connection, and report measured update latency. Avoid logging raw preview histories or ownership credentials.
+
+## Phase two: make the contribution worth keeping
+
+After the live-stroke foundation works, choose and implement one complete improvement to user value. A shared sketchbook of ordinary moments is a candidate for students, friends, or creative beginners. Its proposed promise is: “Draw something you noticed. Keep what it means to you. See how someone else responded.” Validate that purpose through available evidence or formative use; do not invent user findings. You may choose a stronger alternative if you explain whom it serves and demonstrate a complete experience.
+
+A useful journey could offer an optional shared prompt, private practice, undo and preview, a skippable note explaining a mark, an explicit publish action, and a personal “My traces” history. Returning could mean revisiting, adding a reflection, replaying the wall, exporting a keepsake, or finding a visual response. Keep the core experience usable when someone skips every optional field. An accidental gesture should not spend the daily contribution.
+
+Resolve public live drawing and private drafting explicitly. Visitors must know when other people can see their gesture. A private practice session or draft must never be broadcast automatically; enter a clearly labelled public live-drawing mode only through a deliberate action. Private notes, tags, and unshared drafts must stay out of preview events. If you introduce a publish-confirmation step, define preview expiry, cancellation, and finalization around that step rather than leaving temporary lines behind indefinitely.
+
+Optional titles, self-selected themes, creation dates, saved prompt versions, personal notes, and later reflections should earn their place by helping people remember, find, or compare their drawings. Chosen weather/place context or self-described energy can support a later experiment, but avoid passive tracking and psychological inference. Keep personal context private by default, separate it from public artwork, explain the audience, and support understandable editing, export, and deletion. Disclose browser-cookie recovery limits; retain anonymous browser identity by default.
+
+Consider an opt-in visual duet: another visitor spends their next eligible contribution responding to an invited mark, preserving both drawings. Define invitation withdrawal, simultaneous responses, hiding/reporting, and deletion. Drawings can still be abusive without typed text, so provide proportionate handling for the actual audience. A duet is optional; a shared prompt, live composition, and meaningful personal history can form a smaller complete release.
+
+Initially retain the rolling 24-hour public limit, while allowing private practice and revisiting anytime. Show the exact next-eligible time. Cancelled or rejected attempts must not consume it; retries after a successful but unacknowledged save must not create another mark. Explore other rhythms only as a deliberate product decision, with timezone boundaries, migration, server enforcement, and updated checks explained.
+
+## How broader changes interact with the original rules
+
+The historical prohibitions on text, new stored context, and external requests govern the initial streaming upgrade. This combined brief permits deliberate departures for the selected product improvement; do not treat those prohibitions as a permanent ban on every idea above. Before introducing such a change, revise the relevant argument in `README.md`, the historical harness rules below the protected pod-riff block in `CLAUDE.md`, and the affected tests together. Explain the benefit and tradeoff rather than silently adding an exception.
+
+The live-preview layer remains ephemeral in every phase. Any newly supported private annotations or saved drafts are a separate, intentional data feature with an explicit visibility and retention model. Preserve existing records with tested migrations, keep persistent backend state at the established `DB_PATH`, and do not assume the existing Fly volume is empty. Private data must not leak through public queries, SSE, shared exports, or logs. Preserve `spec/invariants.test.ts`; adapt old product-specific expectations only when the documented product decision changes them, never merely to make a failing test disappear.
+
+## UI/UX and unrestricted inspiration
+
+Use a clear, welcoming interface with understandable primary actions and compact navigation. A calm sketchbook aesthetic is one possibility, not a mandatory visual style. Preserve keyboard drawing and support mouse, touch, and stylus. Provide visible focus, readable contrast, appropriate control sizes, and reduced motion using [WCAG guidance](https://www.w3.org/WAI/WCAG22/Understanding/target-size-minimum.html). Show connection, drawing, saving, and publication status accurately; do not imply persistence before server confirmation.
+
+Handle an empty wall, a crowded wall, cooldown, private/public mode, long history, errors, and reconnects without losing work or stealing focus. Plan how visitors can find their own contribution and notice what changed. Relevant shared updates should appear automatically without manual refresh, within about one second. Use live delivery or suitably fast automatic polling for appropriate views; choose and measure the interval rather than periodically reloading the whole page.
+
+Study [Wplace](https://wplace.live/), Steam games, and diverse web apps for inspiration. Investigate collaborative creation, spatial exploration, feedback, short rituals, and reasons to return, not just their visual styles. Explore time capsules, collective stories, postcards, replayable compositions, group sessions, or entirely different purposes. Combine ideas freely. Do not limit imagination to a drawing diary or to this list; select a coherent concept whose value you can explain and demonstrate.
+
+## APIs, packages, and optional product AI
+
+Actively explore existing APIs, packages, UI component libraries, animation tools, drawing tools, and accessibility utilities. Research current official documentation and compatibility with the installed stack. Reuse capable tools instead of rebuilding everything, and explain each addition through its user benefit. Self-host browser assets where possible; installing a package does not require sending visitors to a third-party runtime service.
+
+Candidates include [perfect-freehand](https://github.com/steveruizok/perfect-freehand) for stroke geometry, [Zod](https://zod.dev/) for validation, and [Playwright/axe](https://playwright.dev/docs/accessibility-testing) for verification. [The Met API](https://metmuseum.github.io/) or [Open-Meteo](https://open-meteo.com/en/docs) could inspire prompts. These are examples, not a fixed list. For an external integration selected in phase two, check rights, attribution, terms, data transmission, latency, caching, and fallbacks. Prefer server-side retrieval of public inspiration; do not send visitor drawings or notes to those APIs. External failures must not block drawing, saving, or returning.
+
+AI inside the product is optional. It could suggest prompts or reflection questions from inputs users deliberately select, but following [Google PAIR](https://pair.withgoogle.com/chapter/user-needs/), demonstrate value over curated alternatives. Explain external transmission and obtain consent for private inputs, keep credentials server-side, validate and safely render outputs, bound costs, and provide a usable fallback. AI must not invent psychological conclusions or automatically publish, delete, or change sharing. Development-agent best practices are required even if Trace has no AI feature.
+
+## Verification and development practice
+
+Define the audience, first/return journeys, smallest useful release, dependency decisions, and acceptance checks before implementing. Use complete slices and meaningful red-green-refactor. Delegate bounded research or review where useful, assign file ownership to workers, preserve others' changes, and obtain an independent correctness review before completion. Separate verified facts, source assertions, design hypotheses, mocked checks, real browser checks, and human feedback.
+
+Extend `spec/wall-client.test.ts`, which the supplied brief describes as driving the real `public/wall.js` through jsdom pointer and keyboard events, rather than testing only a description of the desired behaviour. Show a remote preview growing before final submission, two simultaneous gestures staying separate, and cancellation leaving nothing behind. Cover touch/keyboard paths, publish rejection, reversed response/event order, duplicate events, delayed preview resurrection, expiry, and recovery without draft loss.
+
+Extend the server/SSE coverage in `spec/wall.test.ts` or suitable adjacent tests. Prove that preview creation, updates, cancellation, expiry, and abandoned gestures never reach `allMarks()` or the persistent artwork database. Verify ownership, server-derived colour, payload/rate bounds, eligibility, privacy, authoritative post-persistence broadcasting, and unchanged daily allowance. For selected phase-two data features, add meaningful private/public boundary and migration tests without weakening preview invariants.
+
+Keep `spec/invariants.test.ts` green and run the repository's required checks, including the current `pnpm check` and `pnpm check:evidence` commands where applicable. Use isolated sessions and disposable fixtures to test persistence, concurrency, reconnects, and failed requests. Browser-check 390 × 844 and 1920 × 1080, resize during a gesture, and exercise actual input rather than relying on screenshots alone. Test restart and deployment persistence in the supported environment without deleting real visitor data.
+
+## Completion
+
+Finish the live-stroke upgrade and the selected coherent product slice within the receiving task's authority. This is an unattended riff run, so make reasonable documented choices, provide fallbacks for unavailable optional services, and do not stop with unresolved design questions or an unimplemented feature list. Follow the receiving environment's authorization for external actions; do not alter the original final-project repository.
+
+Update the README, especially its real-time explanation, to describe what you actually built and verified. Preserve the pod-riff governing instructions, keep the application deployable, and deliver a concise rationale, screenshots of the complete flow, check results, migration/rollback notes, and clearly separated later ideas. Use the [COMP4020 final-project brief](https://comp.anu.edu.au/courses/comp4020-agentic-coding-studio/assessments/final-project/) as design context for meaningful shared use, real-time updates, and persistence, while following this riff's own process requirements.
+
+Success means visitors can watch another person's contribution take shape without refresh, trust that finished work is saved and temporary work disappears correctly, and explain what they contributed, what they received, and why they would return.

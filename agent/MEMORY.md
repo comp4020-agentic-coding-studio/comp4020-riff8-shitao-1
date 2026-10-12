@@ -90,6 +90,13 @@ Durable self-knowledge, curated run by run; ephemeral state belongs in
   preview server's own log line for the port it actually bound, or check the
   title/take a screenshot immediately after `open`, rather than assuming the
   `--port` you requested is the one you got.
+- **`flyctl` only resolves inside a repo with its own `mise.toml`.** From
+  `/tmp`, `mise exec -- flyctl` errors "No version is set for shim" (no
+  global pin); run it from the deliverable's clone.
+- **`agent-browser`'s mise shim errors "No version is set" on this host.**
+  Call it by full path:
+  `/home/ben/.local/share/mise/installs/npm-agent-browser/0.38.2/node_modules/.bin/agent-browser`
+  (checked again crit-9, 52h to cutoff).
 - **`agent-browser` viewport**: it's `agent-browser set viewport <w> <h>` as
   its own command, not a `--viewport` flag on `open`. Passing it to `open`
   fails silently-ish (open still succeeds) and screenshots come back at the
@@ -725,7 +732,9 @@ Durable self-knowledge, curated run by run; ephemeral state belongs in
   tab open (crit-9): the native retry-with-`Last-Event-ID` never happened.
   A redeploy does exactly this. Any SSE client needs its own "on `error`, if
   `CLOSED`, reopen after a delay from the last id seen" fallback; don't count
-  on the spec's retry behaviour.
+  on the spec's retry behaviour. Also reopen on `visibilitychange` to visible
+  (close the old stream and clear any pending retry timer, or two end up
+  open): a backgrounded phone tab can hold a dead socket with no `error`.
 - **A second or third named `agent-browser` session can lose its cookie jar
   mid-test; the first-opened session kept its own.** Crit-9: sessions `c9b`/`c9c`
   showed empty `agent-browser --session X cookies` right after a server
@@ -736,6 +745,56 @@ Durable self-knowledge, curated run by run; ephemeral state belongs in
   jar is empty.
 
 ## Working habits that paid off
+
+- **When a long-running deliverable rolls into a new crit, grep its README
+  and PROCESS for forward references to "the next crit"/"yet"/"proof of
+  life".** `comp4020-final-shitao` (crit-9, 69h to cutoff): crit-8 prose
+  promising to revisit things "in the crit after this one" was still live
+  mid-crit-9, reading to the pod as open questions. No check catches it.
+
+- **`pointercancel` is not `pointerup`, and pointer handlers need a
+  `pointerId`.** `comp4020-final-shitao` (crit-9, 135h to cutoff): wiring
+  `pointercancel` to the same `finish()` posted any touch the OS took over;
+  not tracking the id let a second finger restart and corrupt the gesture.
+  Found by rereading the client as "the pod draws on phones at once." Check
+  both on any pointer-driven app before a phone crit.
+
+- **On a landscape phone, a full-width drawing surface taller than the
+  viewport turns the swipe to scroll into an input.** `comp4020-final-shitao`
+  (crit-9, 111h to cutoff): every check passed at 390×844 and desktop, but at
+  844×390 the wall overflowed the screen and `touch-action: none` made a
+  scroll swipe post a one-a-day mark. Cap the surface's width by viewport
+  height (keeping its aspect ratio) and only take touch while it's actually
+  drawable. Test landscape phone sizes for any touch-input app, not just the
+  two marking viewports.
+
+- **On an app whose CI deploys every push, a deploy is a guaranteed
+  network failure for anyone mid-action, so a client that discards input
+  on a failed request will lose work.** `comp4020-final-shitao` (crit-9):
+  `wall.js` dropped a stroke on any fetch error or 502. Keep the input,
+  retry the same idempotency token with backoff, and let the broadcast echo
+  settle a lost reply. Test it for real by killing the server between the
+  gesture and the post, then restarting it.
+
+- **A server refusal is state, not just a message.** `comp4020-final-shitao`
+  (crit-9): a 429 showed its text but left the tab offering marks it would
+  refuse again. Send `Retry-After` on a 429 and have the client update what
+  it offers from it, not only print the body.
+
+- **Measure the live data before deciding a limit.** `comp4020-final-shitao`
+  (crit-9): path lengths of every mark on the live wall (parsed from the
+  served page) showed a clear gap between ordinary marks (<1,750 units) and
+  two floods (6k, 34k), which set the ink cap and gave the ADR its evidence.
+  A new cap can break old specs that build "unique" inputs from
+  `Date.now()`; check what they generate.
+
+- **When the server validates a client-built payload (a length cap, a
+  regex), check the client enforces the same limit as it builds, or a user
+  loses work to a rejection they couldn't see coming.** `comp4020-final-shitao`
+  (crit-9): `PATH_RE` capped a mark at 2000 segments, `wall.js` didn't, so a
+  long scribble was refused and discarded on lift. The live wall's own
+  densest mark (773 points) showed real hands were already close. Grep each
+  server-side limit for a client counterpart.
 
 - **Read each spec line literally against the app, as its own framing ---
   a test named after a spec line can quietly check a weaker claim.**
@@ -798,7 +857,10 @@ Durable self-knowledge, curated run by run; ephemeral state belongs in
   live in `agent-browser` (fresh-hand session, one `Tab` press landed focus
   on the wall since `tabindex="0"` is only present when a hand can actually
   draw) that Escape cancels cleanly and a real gesture still posts right
-  after. General lesson: for any app whose entire interaction surface is one
+  after. Same reread on crit-9 found the status line wall.js rewrites was
+  never a live region (`role="status"`), so screen readers heard no outcome;
+  check JS-updated status text for this alongside keyboard input.
+  General lesson: for any app whose entire interaction surface is one
   pointer-driven element, a dedicated accessibility-framed reread (not
   folded into a race/content/layout pass) is a distinct, apparently
   still-fruitful angle even after many clean verification runs — the standing
@@ -898,6 +960,11 @@ Durable self-knowledge, curated run by run; ephemeral state belongs in
   attaches it, rereads the current value — attach-time gating and
   fire-time gating are easy to conflate and only one of them actually
   matters once the page has been open a while.
+  The reverse also bites (crit-9): listeners gated *off* at load never
+  come back when the flag should flip true mid-session, e.g. the 24h window
+  running out in an open tab. Attach them always, gate when they fire, and
+  re-check time-based flags on `visibilitychange`, because a sleeping
+  phone stalls its timers.
 - **When a route validates some untrusted form fields against an enum/lookup
   but not others, the unvalidated one is a live bug, not a stylistic gap —
   check what actually happens when it's wrong.** `comp4020-crit7-shitao`
@@ -1374,6 +1441,15 @@ status -a <repo-name>` early in any run on a Fly.io deliverable and redeploy
 whenever it's meaningfully behind local `main` --- don't wait for the
 finishing run, and don't trust a prior run's `now.md` characterisation of
 what's gated without rereading the doctrine's own step 7 wording.
+
+**Once CI deploys every push, a failed CI run leaves live stale silently.**
+`gh` is unauthenticated here, but the public repo's Actions API isn't:
+`curl -s api.github.com/repos/comp4020-agentic-coding-studio/<repo>/actions/runs?per_page=3`
+gives each run's `conclusion`. Crit-9 (45h to cutoff): a run failed at
+"Build and start the app" and the deploy job was skipped; the image built
+and passed locally, so I deployed by hand with `flyctl deploy`; the next
+push's CI passed unchanged, so one failure there can be transient. Check this
+and `flyctl releases` early in each run; compare a changed asset by curl.
 
 **A `flyctl status` machine `STATE` of `stopped` is not evidence the deploy is
 stale --- check the image version against local `main`, or just `curl` it.**

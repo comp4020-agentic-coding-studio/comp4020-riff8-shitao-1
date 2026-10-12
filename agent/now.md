@@ -1,32 +1,37 @@
 # now
 
-**`comp4020-final-shitao`, crit-9 ("All at once") --- built, committed
-locally, not pushed.** Run at 141h to cutoff.
+**`comp4020-final-shitao`, crit-10 ("Fly by instruments") --- first run,
+165h to cutoff. Built the core; nothing pushed (push waits for the inside-24h
+finishing run).**
+
+## State
+
+Local `main` is `deb758c`, five commits ahead of `origin/main` (`028c2bd`).
+Live Fly is deployed by hand from `deb758c` and serves it (the new README
+section is on live `/readme/`); the next CI push will redeploy the same code.
+`pnpm check` 70/70. Working tree clean.
 
 ## What this run did
 
-The crit's one decision: what a tab sees after its stream drops (phone lock,
-or the redeploy every push to `main` now triggers). Chose replay from the
-last mark id, recorded in `decisions/0001-coming-back-after-a-gap.md`
-(options, costs, checks) and linked from the README's new "Coming back after
-a gap" section.
+The brief: logs that say who did what (server-side, kept), the see/change
+decision checked on the server and written down, and a crit where two pod
+members use the URL while I narrate from `flyctl logs` alone.
 
-- `7894d00` server: SSE `id:` = mark row id; replays `marksSince` from
-  `Last-Event-ID` or `?since=`; `mine` flag on a hand's own streams (cookie
-  on the stream request); POST returns `{id}`
-- `a1d5567` wall.js: opens with `?since=<data-since>`, dedupes by id,
-  reopens a stream Chrome left `CLOSED`, paints another tab's own mark as
-  `mine` and disables drawing (closes crit-8's known second-tab gap)
-- `9645567` ADR + README; `cffb448` PROCESS "Several people at once"
-
-51/51 green, `check:evidence` green, each new client test confirmed to fail
-against the old `wall.js`. Real-browser kill/restart/post test: the missed
-mark appeared, no reload.
+- `src/log.ts` + `server.ts`: one logfmt line per event (`hand.new`,
+  `wall.view`, `stream.open/close`, `mark.add`, `mark.refused reason=...`),
+  hand named `name#row` (names collide: two `idle-orchard`s on a fresh wall),
+  never cookie/IP/UA. `db.ts` exposes `rowid AS n`.
+- `spec/log.test.ts`, plus a wall test that a made-up cookie gets a fresh hand.
+- `decisions/0003` (see/change + logging, options turned down: undo, showing
+  names, moderator, logging cookie/IP), README section, CLAUDE.md rule.
+- Verified with two `agent-browser` sessions locally, and on live `flyctl logs`.
 
 ## Next action
 
-Finishing run: write `reflections/crit-9.md` (title "All at once", raw JSON
-`title`), trim PROCESS.md (~830 words by `wc` now), push (CI deploys), then
-verify live: open two tabs on `.fly.dev`, draw in one, see it in the other.
-A mid-week run could also handle SIGTERM by ending SSE responses cleanly so
-browsers retry natively, but the client fallback already covers it.
+Rehearse the crit literally: two fresh browser sessions on the live URL,
+narrate only from `mise exec -- flyctl logs -a comp4020-final-shitao` (run
+from the repo dir; mise has no global flyctl). Ask whether the log lets a
+narrator say which *person* is which: maybe log a `mark.add` position (a
+coarse "upper left") so "the purple one in the corner" maps to a line. Crawler
+`hand.new` noise is a candidate too. Then update PROCESS.md for crit 10, and
+on the final run write `reflections/crit-10.md` (title "Fly by instruments").

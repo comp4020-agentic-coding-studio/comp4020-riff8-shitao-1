@@ -202,6 +202,54 @@ table and ignores the new columns and the `notes` table. Deleted marks
 would come back as empty paths (invisible), and notes would sit unread
 until the new version returned.
 
+## Who did what, from the server's side
+
+Two people on two browsers are two hands. A hand is the `hand` cookie
+`src/identity.ts` mints on a first visit, with a nickname and a colour
+derived from it once and stored; there are no accounts, sessions or
+logins, and nothing here adds any. That cookie is also the only thing the
+server checks before it lets anyone change anything. A note can be set,
+a mark deleted, a keepsake downloaded or a live stroke extended or
+cancelled only by the hand that made it, and those checks run in
+`src/db.ts` and `src/live.ts`, not in the page. Hiding the Delete button
+from other hands would stop nobody with `curl`; the server's refusal does.
+
+What was missing was any record of it. Now every action that changes
+something, and every refusal, prints one line to the server's log, which
+on Fly is what `flyctl logs -a <app>` shows:
+
+```
+2026-10-12T09:03:01Z  curious-harbour/7713      new hand
+2026-10-12T09:03:01Z  gentle-orchard/99ea       new hand
+2026-10-12T09:03:05Z  curious-harbour/7713      started a live stroke
+2026-10-12T09:03:11Z  curious-harbour/7713      committed its live stroke as mark #19
+2026-10-12T09:03:12Z  gentle-orchard/99ea       denied: tried to delete mark #19 (not owner)
+2026-10-12T09:03:16Z  curious-harbour/7713      set a note on mark #19
+2026-10-12T09:03:21Z  curious-harbour/7713      deleted mark #19
+```
+
+That's a real run with two browsers. The four hex digits after each
+nickname are a hash of the hand's id, because ten adjectives and ten nouns
+only make a hundred nicknames: in one run of the spec, 35 fresh hands
+already produced two `bold-pebble`s and two `idle-heron`s. The hash tells
+them apart without writing the cookie itself into the log. A browser with
+no cookie at all (a fresh profile hitting a route directly) shows up as
+`(no hand)`. A returning hand adds nothing to the log until it does
+something; only a brand-new one is announced.
+
+The log says what happened and to which mark, never what was drawn or
+written: no path, no note text, no prompt wording. Otherwise the log
+would be a second way to read the notes `/mine/` keeps private.
+`spec/log.test.ts` boots its own server, drives several hands at it,
+including the refused cross-hand cases, and checks both that each line
+appears and that the note text, the path and the cookie value don't.
+
+This is the smallest thing that makes two visitors distinguishable to
+whoever runs the app. The identity already existed and the enforcement
+already lived on the server; the log only says out loud what the server
+was already deciding. Anything bigger, such as accounts or an admin page,
+would start remembering people in a way the cookie deliberately doesn't.
+
 ## Later ideas
 
 These are deliberately not built yet:

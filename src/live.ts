@@ -18,7 +18,7 @@ export type LiveEvent =
   | { type: "preview-end"; gesture: string; reason: "cancelled" | "expired" | "replaced" };
 
 export type UpdateResult =
-  | { ok: true; count: number; events: LiveEvent[] }
+  | { ok: true; count: number; events: LiveEvent[]; started: boolean }
   | { ok: false; status: number; reason: string; count?: number };
 
 interface Preview {
@@ -70,10 +70,14 @@ export function createLive({
   leaseMs,
   heldMaxMs = 120_000,
   maxAgeMs = 10 * 60 * 1000,
+  onExpire,
 }: {
   leaseMs: number;
   heldMaxMs?: number;
   maxAgeMs?: number;
+  // Told which hand's preview the sweep ended, for the server's log. The
+  // broadcast event itself never carries a hand id.
+  onExpire?: (handId: string) => void;
 }) {
   const active = new Map<string, Preview>();
   const ended = new Map<string, { handId: string; at: number }>();
@@ -128,6 +132,7 @@ export function createLive({
 
       const events: LiveEvent[] = [];
       let preview = active.get(gesture);
+      const started = !preview;
       if (preview && preview.handId !== handId) {
         return { ok: false, status: 403, reason: "not your gesture" };
       }
@@ -164,7 +169,7 @@ export function createLive({
       if (fresh.length > 0 || heldChanged || count === 0) {
         events.push({ type: "preview", gesture, colour: preview.colour, from: count, points: fresh, held });
       }
-      return { ok: true, count: preview.points.length, events };
+      return { ok: true, count: preview.points.length, events, started };
     },
 
     cancel(handId: string, gesture: unknown, now = Date.now()): LiveEvent[] {
@@ -213,6 +218,7 @@ export function createLive({
         if (now - preview.updatedAt > leaseMs || heldTooLong || tooOld) {
           end(preview, now);
           events.push({ type: "preview-end", gesture: preview.gesture, reason: "expired" });
+          onExpire?.(preview.handId);
         }
       }
       for (const [gesture, entry] of ended) {
@@ -234,5 +240,10 @@ export function createLive({
     },
 
     activeCount: () => active.size,
+
+    // Whose stroke this id is right now, so the server can log a hand
+    // reaching for another's preview. Never sent anywhere.
+    ownerOf: (gesture: unknown): string | undefined =>
+      typeof gesture === "string" ? active.get(gesture)?.handId : undefined,
   };
 }

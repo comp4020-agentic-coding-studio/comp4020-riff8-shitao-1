@@ -94,6 +94,7 @@ const ownMarksStmt = db.prepare(
 const ownsMarkStmt = db.prepare(
   "SELECT 1 FROM marks WHERE id = ? AND hand_id = ? AND deleted_at IS NULL",
 );
+const markOwnerStmt = db.prepare("SELECT hand_id, deleted_at FROM marks WHERE id = ?");
 const upsertNoteStmt = db.prepare(
   `INSERT INTO notes (mark_id, body, updated_at) VALUES (?, ?, ?)
    ON CONFLICT(mark_id) DO UPDATE SET body = excluded.body, updated_at = excluded.updated_at`,
@@ -148,6 +149,15 @@ export function ownMarks(handId: string): OwnMark[] {
 }
 
 const owns = (handId: string, markId: number) => ownsMarkStmt.get(markId, handId) !== undefined;
+
+// Why a hand can't touch a mark, for the log line a refusal writes: the
+// refusal itself is decided by `owns`, not by this.
+export function whyNotYours(handId: string, markId: number): string {
+  const row = markOwnerStmt.get(markId) as unknown as { hand_id: string; deleted_at: number | null } | undefined;
+  if (!row) return "no such mark";
+  if (row.hand_id !== handId) return "not owner";
+  return row.deleted_at === null ? "refused" : "already deleted";
+}
 
 // A blank note deletes it. Returns false if the mark isn't this hand's.
 export function setNote(handId: string, markId: number, body: string, now = Date.now()): boolean {

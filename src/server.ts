@@ -12,11 +12,13 @@ import {
   msUntilNextMark,
   ownMarks,
   setNote,
+  whyNotYours,
 } from "./db.ts";
 import { createLive, type LiveEvent } from "./live.ts";
 import { colourFor, nameFor, newHandId, parseHandCookie, setHandCookie } from "./identity.ts";
 import { keepsakeSvg, minePage, readmePage, untilPhrase, wallPage } from "./pages.ts";
 import { isPrompt, promptFor } from "./prompts.ts";
+import { logAction } from "./log.ts";
 
 const PORT = Number(process.env.PORT ?? 8080);
 // Fly's proxy terminates TLS and forwards plain http; FLY_APP_NAME is only
@@ -59,6 +61,7 @@ const PATH_RE = /^M-?\d+(\.\d+)?,-?\d+(\.\d+)?(\sL-?\d+(\.\d+)?,-?\d+(\.\d+)?){1
 
 interface HandInfo {
   id: string;
+  name: string;
   colour: string;
 }
 
@@ -67,18 +70,21 @@ interface HandInfo {
 function existingHand(req: IncomingMessage): HandInfo | undefined {
   const id = parseHandCookie(req.headers.cookie);
   const found = id ? getHand(id) : undefined;
-  return found ? { id: found.id, colour: found.colour } : undefined;
+  return found ? { id: found.id, name: found.name, colour: found.colour } : undefined;
 }
 
 function ensureHand(req: IncomingMessage, res: ServerResponse): HandInfo {
   const existing = parseHandCookie(req.headers.cookie);
   const found = existing ? getHand(existing) : undefined;
-  if (found) return { id: found.id, colour: found.colour };
+  if (found) return { id: found.id, name: found.name, colour: found.colour };
 
   const id = newHandId();
   const hand = createHand(id, nameFor(id), colourFor(id));
   res.setHeader("Set-Cookie", setHandCookie(id, isProd));
-  return { id: hand.id, colour: hand.colour };
+  // A cookie the database doesn't know (cleared volume, hand-edited cookie)
+  // is still a new hand, but worth telling apart from a first visit.
+  logAction(hand, existing ? "new hand (unrecognised cookie)" : "new hand");
+  return { id: hand.id, name: hand.name, colour: hand.colour };
 }
 
 // The real-time layer: every open tab holds one of these open. Two kinds of
@@ -94,7 +100,10 @@ interface SseClient {
 }
 
 const sseClients = new Set<SseClient>();
-const live = createLive({ leaseMs: PREVIEW_LEASE_MS });
+const live = createLive({
+  leaseMs: PREVIEW_LEASE_MS,
+  onExpire: (handId) => logAction(getHand(handId), "live stroke expired (tab gone quiet)"),
+});
 
 function send(event: string, data: unknown): void {
   const frame = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -200,6 +209,7 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && (url.pathname === "/api/strokes/live" || url.pathname === "/api/strokes/live/cancel")) {
       const hand = existingHand(req);
       if (!hand) {
+        logAction(undefined, "denied: tried to draw live (no hand cookie)");
         json(res, 401, { error: "Load the wall first." });
         return;
       }
@@ -212,7 +222,13 @@ const server = createServer(async (req, res) => {
         return;
       }
       if (url.pathname.endsWith("/cancel")) {
-        broadcastLive(live.cancel(hand.id, body.gesture));
+        const owner = live.ownerOf(body.gesture);
+        const ended = live.cancel(hand.id, body.gesture);
+        if (ended.length > 0) logAction(hand, "cancelled a live stroke");
+        else if (owner && owner !== hand.id) {
+          logAction(hand, "denied: tried to cancel another hand's live stroke (not owner)");
+        }
+        broadcastLive(ended);
         res.writeHead(204);
         res.end();
         return;
@@ -221,14 +237,28 @@ const server = createServer(async (req, res) => {
       // mark right now has nothing to show live either.
       // 403, not 429: this won't change by retrying, unlike a rate limit.
       if (msUntilNextMark(hand.id) > 0) {
+        // Only log the attempt that would have started a stroke, not every
+        // heartbeat a stale tab sends after it.
+        if (live.ownerOf(body.gesture) === undefined && body.from === 0) {
+          logAction(hand, "denied: tried to draw live (already marked in the last 24h)");
+        }
         json(res, 403, { error: "Your mark is already on the wall." });
         return;
       }
       const result = live.update(hand.id, hand.colour, body);
       if (!result.ok) {
+        // 403 is the cross-hand case; 400/413/503 are worth a line too.
+        // 409/410/429 are the protocol's own ordinary races and back-off,
+        // and would drown the log at drawing speed.
+        if (result.status === 403) {
+          logAction(hand, "denied: tried to extend another hand's live stroke (not owner)");
+        } else if (![409, 410, 429].includes(result.status)) {
+          logAction(hand, `refused a live update (${result.reason})`);
+        }
         json(res, result.status, { error: result.reason, count: result.count });
         return;
       }
+      if (result.started) logAction(hand, "started a live stroke");
       broadcastLive(result.events);
       json(res, 200, { count: result.count });
       return;
@@ -260,12 +290,14 @@ const server = createServer(async (req, res) => {
       const prompt = isPrompt(body.prompt) ? body.prompt : null;
 
       if (typeof path !== "string" || !PATH_RE.test(path)) {
+        logAction(hand, "refused a mark (malformed path)");
         broadcastLive(live.cancel(hand.id, gesture));
         res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
         res.end("That doesn't look like a mark.");
         return;
       }
       if (body.note !== undefined && (typeof body.note !== "string" || body.note.length > NOTE_MAX)) {
+        logAction(hand, "refused a mark (note too long)");
         broadcastLive(live.cancel(hand.id, gesture));
         res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
         res.end(`A note can be up to ${NOTE_MAX} characters.`);
@@ -277,6 +309,7 @@ const server = createServer(async (req, res) => {
       // nothing. The original already broadcast.
       const existing = nonce ? markByNonce(hand.id, nonce) : undefined;
       if (existing) {
+        logAction(hand, `retried mark #${existing.id} (already added, nothing changed)`);
         json(res, 201, { id: existing.id, nextAt: existing.created_at + MARK_INTERVAL_MS });
         return;
       }
@@ -289,6 +322,7 @@ const server = createServer(async (req, res) => {
       // separates the two, nothing can interleave here.
       const wait = msUntilNextMark(hand.id);
       if (wait > 0) {
+        logAction(hand, "denied: tried to add a second mark within 24h");
         broadcastLive(live.cancel(hand.id, gesture));
         res.writeHead(429, { "Content-Type": "text/plain; charset=utf-8" });
         res.end(`Your mark is already on the wall. You can add another ${untilPhrase(wait)}.`);
@@ -296,8 +330,18 @@ const server = createServer(async (req, res) => {
       }
 
       const mark = addMark(hand.id, path, hand.colour, Date.now(), { prompt, nonce });
+      const noted = typeof body.note === "string" && body.note.trim() !== "";
       if (typeof body.note === "string") setNote(hand.id, mark.id, body.note);
-      broadcastMark({ ...mark, gesture: live.commit(hand.id, gesture) });
+      const otherOwner = live.ownerOf(gesture);
+      const committed = live.commit(hand.id, gesture);
+      logAction(
+        hand,
+        `${committed ? "committed its live stroke as" : "added"} mark #${mark.id}${noted ? " with a note" : ""}`,
+      );
+      if (!committed && otherOwner && otherOwner !== hand.id) {
+        logAction(hand, "denied: tried to claim another hand's live stroke (not owner)");
+      }
+      broadcastMark({ ...mark, gesture: committed });
       json(res, 201, { id: mark.id, nextAt: mark.created_at + MARK_INTERVAL_MS });
       return;
     }
@@ -333,7 +377,8 @@ const server = createServer(async (req, res) => {
       }
       const keepsake = url.pathname.match(/^\/mine\/marks\/(\d+)\.svg$/);
       if (req.method === "GET" && keepsake && hand) {
-        const mark = ownMarks(hand.id).find((m) => m.id === Number(keepsake[1]));
+        const markId = Number(keepsake[1]);
+        const mark = ownMarks(hand.id).find((m) => m.id === markId);
         if (mark) {
           res.writeHead(200, {
             "Content-Type": "image/svg+xml; charset=utf-8",
@@ -342,8 +387,13 @@ const server = createServer(async (req, res) => {
           res.end(keepsakeSvg(mark));
           return;
         }
+        logAction(hand, `denied: tried to download mark #${markId} (${whyNotYours(hand.id, markId)})`);
       }
       const action = url.pathname.match(/^\/mine\/marks\/(\d+)\/(note|delete)$/);
+      // A fresh browser (another profile, incognito) has no hand to act as.
+      if (req.method === "POST" && action && !hand) {
+        logAction(undefined, `denied: tried to ${action[2] === "note" ? "set a note on" : "delete"} mark #${action[1]} (no hand cookie)`);
+      }
       if (req.method === "POST" && action && hand) {
         const markId = Number(action[1]);
         // 500 characters of note can urlencode to several KB.
@@ -358,12 +408,20 @@ const server = createServer(async (req, res) => {
         const form = new URLSearchParams(raw);
         if (action[2] === "note") {
           const note = form.get("note") ?? "";
-          if (note.length <= NOTE_MAX && setNote(hand.id, markId, note)) {
+          if (note.length > NOTE_MAX) {
+            logAction(hand, `refused a note on mark #${markId} (too long)`);
+          } else if (setNote(hand.id, markId, note)) {
+            logAction(hand, `${note.trim() === "" ? "cleared the note on" : "set a note on"} mark #${markId}`);
             res.writeHead(303, { Location: `/mine/?saved=${markId}#mark-${markId}` });
             res.end();
             return;
+          } else {
+            logAction(hand, `denied: tried to set a note on mark #${markId} (${whyNotYours(hand.id, markId)})`);
           }
-        } else if (deleteMark(hand.id, markId)) {
+        } else if (!deleteMark(hand.id, markId)) {
+          logAction(hand, `denied: tried to delete mark #${markId} (${whyNotYours(hand.id, markId)})`);
+        } else {
+          logAction(hand, `deleted mark #${markId}`);
           send("unmark", { id: markId });
           res.writeHead(303, { Location: "/mine/?deleted=1" });
           res.end();

@@ -37,6 +37,13 @@ cross-hand action is the actual proof that enforcement works. A helper
 function for the "nickname  verb  target" formatting beats repeating it at
 each call site.
 
+Also log the one distinction `ensureHand` (`src/server.ts`) already makes for
+free: when it mints a brand-new id via `createHand`, that's a new hand; when
+it resolves an existing cookie, that's a returning one. A line like
+`quiet-sparrow  new hand` the first time, nothing extra on later requests, is
+enough — this is surfacing a fact the server already computes, not adding
+new tracking.
+
 **Never log content.** No private note text, no stroke path data, no prompt
 text beyond what's already public on the wall. The log line says what
 happened and to which mark id, never what was drawn or written — logging
